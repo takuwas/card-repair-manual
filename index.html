@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="ポケモンカード修復マニュアル - CRSコミュニティ「ポケカリペア」の知見を統合した完全ガイド">
+  <title>ポケモンカード修復マニュアル【完全版】</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Markdown renderer + GitHub-style markdown CSS -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <button id="sidebar-toggle" class="sidebar-toggle" aria-label="目次を開く">☰</button>
+  <h1 class="topbar-title">📘 ポケモンカード修復マニュアル</h1>
+  <div class="topbar-actions">
+    <input type="search" id="search" class="search-box" placeholder="🔍 検索 (Ctrl+K)" autocomplete="off">
+    <button id="theme-toggle" class="theme-toggle" aria-label="ダークモード切替">🌙</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside id="sidebar" class="sidebar">
+    <nav id="toc" class="toc" aria-label="目次">
+      <div class="toc-loading">目次を生成中...</div>
+    </nav>
+  </aside>
+
+  <main id="content" class="content">
+    <div class="loading">
+      <div class="spinner"></div>
+      <p>マニュアルを読み込み中...</p>
+    </div>
+  </main>
+</div>
+
+<div id="search-results" class="search-results" hidden>
+  <div class="search-results-header">
+    <span id="search-count"></span>
+    <button id="search-close" aria-label="検索結果を閉じる">×</button>
+  </div>
+  <ul id="search-results-list"></ul>
+</div>
+
+<footer class="footer">
+  <p>
+    出典: <a href="https://discord.gg/" target="_blank" rel="noopener">CRS Discord「ポケカリペア」</a>
+    ｜ ソース: <code>source.md</code> / <code>manual.md</code>
+    ｜ <a href="https://github.com/" target="_blank" rel="noopener">GitHub</a>
+  </p>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

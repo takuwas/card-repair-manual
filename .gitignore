@@ -1,0 +1,18 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# エディタ
+.vscode/
+.idea/
+*.swp
+*~
+
+# ローカルテストファイル
+*.log
+
+# 中間生成物（保持したい場合は --force でcommit）
+working/restructure_ch6.py
+
+# ローカルプレビュー用
+node_modules/
