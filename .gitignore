@@ -11,8 +11,11 @@ Thumbs.db
 # ローカルテストファイル
 *.log
 
-# 中間生成物（保持したい場合は --force でcommit）
-working/restructure_ch6.py
+# 中間生成物（GitHub には push しない、Cloudflare Pages にも公開しない）
+working/
 
 # ローカルプレビュー用
 node_modules/
+
+# Wrangler ローカルキャッシュ（GitHubには push しない）
+.wrangler/
