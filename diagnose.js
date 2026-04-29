@@ -370,22 +370,20 @@
   }
   // OpenCV.js はサイズが大きく（〜10MB）WASM 初期化でメインスレッドが一瞬重くなる。
   // ・preload (HTMLヘッダ) でダウンロードはページレンダリングと並行で進む
-  // ・実行（コンパイル＋初期化）は load イベント後の idle 時間に開始 → 初期表示はブロックしない
+  // ・実行（コンパイル＋初期化）は DOM ready 後 500ms 遅延で開始
+  //   → 初期表示はブロックしない
   // ・ユーザーがそれより早くアップロードした場合は handleFile() 内で同じ Promise を待機する
+  // 注意: requestIdleCallback は環境によって発火しないことがあるため使用しない。
   function startOpenCVPrewarm() {
-    const start = () => {
+    setTimeout(() => {
+      console.log('[diagnose] starting OpenCV prewarm');
       waitForOpenCV().catch(err => console.warn('[diagnose] OpenCV prewarm:', err.message));
-    };
-    if ('requestIdleCallback' in window) {
-      window.requestIdleCallback(start, { timeout: 2000 });
-    } else {
-      setTimeout(start, 500);
-    }
+    }, 500);
   }
-  if (document.readyState === 'complete') {
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
     startOpenCVPrewarm();
   } else {
-    window.addEventListener('load', startOpenCVPrewarm, { once: true });
+    document.addEventListener('DOMContentLoaded', startOpenCVPrewarm, { once: true });
   }
 
   // ============================================================
