@@ -182,50 +182,103 @@
     }
   }
 
-  function waitForOpenCV() {
-    if (cvReadyPromise) return cvReadyPromise;
-    cvReadyPromise = new Promise((resolve, reject) => {
-      const start = Date.now();
-      const TIMEOUT_MS = 60000;
+  // 複数のCDNを順番に試す（最初に成功したものを使う）
+  const OPENCV_CDN_URLS = [
+    'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
+    'https://docs.opencv.org/4.10.0/opencv.js',
+    'https://docs.opencv.org/4.x/opencv.js',
+    'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js'
+  ];
 
+  function loadScript(url, timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.async = true;
+      script.src = url;
+      let done = false;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        script.remove();
+        reject(new Error('timeout'));
+      }, timeoutMs);
+      script.onload = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(script);
+      };
+      script.onerror = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        script.remove();
+        reject(new Error('script error'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  function waitForOpenCVRuntime(timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
       function check() {
         if (window.cv && typeof window.cv.Mat === 'function') {
-          // 既に runtime initialized
-          cvReady = true;
-          setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
           resolve(window.cv);
           return;
         }
-        if (window.cv && window.cv.onRuntimeInitialized !== undefined && !window.cv['Mat']) {
-          // ロード途中: onRuntimeInitialized でフックする
+        if (window.cv && window.cv.onRuntimeInitialized !== undefined) {
           const prev = window.cv.onRuntimeInitialized;
           window.cv.onRuntimeInitialized = () => {
             if (typeof prev === 'function') { try { prev(); } catch (_) {} }
-            cvReady = true;
-            setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
             resolve(window.cv);
           };
           return;
         }
-        if (Date.now() - start > TIMEOUT_MS) {
-          cvLoadFailed = true;
-          setCvStatus('failed', '⚠️ OpenCV.js の読み込みに失敗しました（ネットワークをご確認ください）');
-          reject(new Error('OpenCV.js load timeout'));
+        if (Date.now() - start > timeoutMs) {
+          reject(new Error('runtime init timeout'));
           return;
         }
         setTimeout(check, 200);
       }
       check();
     });
+  }
 
-    // script の onerror 監視
-    const cvScript = document.getElementById('opencv-script');
-    if (cvScript) {
-      cvScript.addEventListener('error', () => {
-        cvLoadFailed = true;
-        setCvStatus('failed', '⚠️ OpenCV.js のダウンロードに失敗しました');
-      });
-    }
+  async function waitForOpenCV() {
+    if (cvReadyPromise) return cvReadyPromise;
+    cvReadyPromise = (async () => {
+      // 既にロード済みの場合
+      if (window.cv && typeof window.cv.Mat === 'function') {
+        cvReady = true;
+        setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
+        return window.cv;
+      }
+      let lastErr = null;
+      for (let i = 0; i < OPENCV_CDN_URLS.length; i++) {
+        const url = OPENCV_CDN_URLS[i];
+        const host = new URL(url).hostname;
+        setCvStatus('loading', `⏳ 検出エンジン (OpenCV.js) を読み込み中… (${host})`);
+        try {
+          await loadScript(url, 30000);
+          await waitForOpenCVRuntime(30000);
+          cvReady = true;
+          setCvStatus('ready', `✅ 検出エンジン (OpenCV.js) の準備完了 (${host})`);
+          return window.cv;
+        } catch (err) {
+          lastErr = err;
+          console.warn(`[diagnose] OpenCV CDN failed: ${host} (${err.message})`);
+          // 次のCDNを試す前に window.cv をリセット
+          if (window.cv && typeof window.cv.Mat !== 'function') {
+            try { delete window.cv; } catch (_) { window.cv = undefined; }
+          }
+        }
+      }
+      cvLoadFailed = true;
+      const msg = '⚠️ OpenCV.js の読み込みに失敗しました（全CDN応答なし）。ネットワーク・広告ブロッカー・拡張機能をご確認ください。';
+      setCvStatus('failed', msg);
+      throw lastErr || new Error('all CDNs failed');
+    })();
     return cvReadyPromise;
   }
   // 即座にロードを開始
