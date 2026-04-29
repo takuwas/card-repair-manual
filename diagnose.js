@@ -230,9 +230,9 @@
     return new Promise((resolve, reject) => {
       const script = document.createElement('script');
       script.async = true;
-      // preload (HTML 側) が crossorigin 付きで同URLを先読みしているため、
-      // 一致させて preload を有効化する。CDN は CORS 対応している前提。
-      script.crossOrigin = 'anonymous';
+      // crossOrigin を付けない: 単独テストで cv.Mat が 0.9秒で利用可能だったが、
+      // crossOrigin='anonymous' を付けると永久にハングする現象を確認したため。
+      // OpenCV.js (techstark v4.10) は単一ファイル（WASM埋め込み）なので CORS は不要。
       script.src = url;
       let done = false;
       const timer = setTimeout(() => {
@@ -298,74 +298,92 @@
 
   async function waitForOpenCV() {
     if (cvReadyPromise) return cvReadyPromise;
-    cvReadyPromise = (async () => {
+    cvReadyPromise = new Promise((resolve, reject) => {
       // 既にロード済みの場合
       if (window.cv && typeof window.cv.Mat === 'function') {
         cvReady = true;
         setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
-        return window.cv;
+        resolve(window.cv);
+        return;
       }
 
-      // ============================================================
-      // フェーズ1: スクリプトのダウンロード（CDNフォールバック）
-      // ------------------------------------------------------------
-      // ダウンロードはネットワーク要因で失敗しうるので CDN を順に試す。
-      // 各CDN 15秒タイムアウト。スクリプト本体（〜10MB）が落ちてくれば成功。
-      // ============================================================
-      let downloadOK = false;
-      let lastErr = null;
-      for (let i = 0; i < OPENCV_CDN_URLS.length; i++) {
-        const url = OPENCV_CDN_URLS[i];
-        const host = new URL(url).hostname;
-        setCvStatus('loading', `⏳ 検出エンジンをダウンロード中… (${host})`);
-        try {
-          await loadScript(url, 15000);
-          downloadOK = true;
-          break; // 1つでも成功すれば次のフェーズへ
-        } catch (err) {
-          lastErr = err;
-          console.warn(`[diagnose] OpenCV CDN download failed: ${host} (${err.message})`);
-          // ダウンロードが落ちたCDNは部分的なwindow.cvが残っているかもしれないのでクリア
-          if (window.cv && typeof window.cv.Mat !== 'function') {
-            try { delete window.cv; } catch (_) {}
-            try { window.cv = undefined; } catch (_) {}
-          }
+      // 重要: Emscripten の流儀で、script ロード前に Module を設定する。
+      // onRuntimeInitialized で resolve するのが OpenCV.js の正しい使い方。
+      // ポーリング方式は不要（minimal test では 0.9秒でこのコールバックが発火することを確認済み）。
+      const TOTAL_TIMEOUT = 90000;
+      let done = false;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        cvLoadFailed = true;
+        setCvStatus('failed', '⚠️ OpenCV.js のロードがタイムアウトしました。リロードまたはネットワーク確認をお願いします。');
+        reject(new Error('opencv load timeout'));
+      }, TOTAL_TIMEOUT);
+
+      window.Module = window.Module || {};
+      const prevOnRuntime = window.Module.onRuntimeInitialized;
+
+      // 完了判定の共通処理。コールバック・ポーリングどちらでも先勝ちで成功扱い。
+      const markReady = () => {
+        if (done) return;
+        if (!(window.cv && typeof window.cv.Mat === 'function')) return; // まだ未完
+        done = true;
+        clearTimeout(timer);
+        cvReady = true;
+        setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
+        resolve(window.cv);
+      };
+
+      window.Module.onRuntimeInitialized = () => {
+        if (typeof prevOnRuntime === 'function') { try { prevOnRuntime(); } catch (_) {} }
+        // techstark v4.10 は cv.Mat がここで使えるはず
+        markReady();
+      };
+
+      // バックアップ: 500ms ポーリング (setTimeout チェーン)
+      // setInterval だと WASM 初期化中に複数回キューされてクラッシュ要因になる場合があるため
+      function poll() {
+        if (done) return;
+        if (window.cv && typeof window.cv.Mat === 'function') {
+          markReady();
+          return;
         }
+        setTimeout(poll, 500);
       }
-      if (!downloadOK) {
-        cvLoadFailed = true;
-        setCvStatus('failed', '⚠️ OpenCV.js のダウンロードに失敗しました。ネットワーク／広告ブロッカー／拡張機能をご確認ください。');
-        throw lastErr || new Error('all CDNs failed to download');
-      }
+      // 最初のポーリングは少し遅らせて WASM 初期化を妨げない
+      setTimeout(poll, 1000);
 
-      // ============================================================
-      // フェーズ2: WASM ランタイム初期化（CDN切り替えしない・長タイムアウト）
-      // ------------------------------------------------------------
-      // ダウンロード成功後、WASM(〜10MB) のコンパイル＋実行が走る。これは
-      // デバイス性能依存で 5〜60秒かかりうる。途中でCDNを切り替えても無意味
-      // （既にロード済みのため）。長めのタイムアウトで待つ。
-      // ============================================================
-      setCvStatus('loading', '⏳ 検出エンジンを初期化中…（10〜60秒、初回のみ）');
-      try {
-        await waitForOpenCVRuntime(90000); // 90秒の長タイムアウト
-      } catch (err) {
-        cvLoadFailed = true;
-        setCvStatus('failed', '⚠️ OpenCV.js の初期化に失敗しました（タイムアウト）。デバイス性能・メモリをご確認ください。');
-        throw err;
+      // CDN を順に試す（ダウンロード失敗時のみ次へ）
+      let cdnIdx = 0;
+      function tryNextCDN() {
+        if (done) return;
+        if (cdnIdx >= OPENCV_CDN_URLS.length) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          cvLoadFailed = true;
+          setCvStatus('failed', '⚠️ OpenCV.js のダウンロードに失敗しました（全CDN応答なし）。');
+          reject(new Error('all CDNs failed'));
+          return;
+        }
+        const url = OPENCV_CDN_URLS[cdnIdx];
+        const host = new URL(url).hostname;
+        setCvStatus('loading', `⏳ 検出エンジンを読み込み中… (${host}、初回は10〜30秒)`);
+        loadScript(url, 15000)
+          .then(() => {
+            // ダウンロード成功。あとは onRuntimeInitialized を待つ（上で登録済み）
+            // setCvStatus はそのままにしておく（ユーザーには「読み込み中」と見える）
+            console.log(`[diagnose] script loaded from ${host}, waiting for runtime init...`);
+          })
+          .catch((err) => {
+            console.warn(`[diagnose] OpenCV CDN failed: ${host} (${err.message})`);
+            cdnIdx++;
+            tryNextCDN();
+          });
       }
-
-      if (!(window.cv && typeof window.cv.Mat === 'function')) {
-        cvLoadFailed = true;
-        setCvStatus('failed', '⚠️ OpenCV.js の初期化に失敗しました（cv.Mat 利用不可）。');
-        throw new Error('cv.Mat still unavailable after runtime init');
-      }
-
-      cvReady = true;
-      setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
-      return window.cv;
-    })();
-    // 失敗時の Unhandled Promise Rejection を抑止
-    cvReadyPromise.catch(() => {});
+      tryNextCDN();
+    });
+    cvReadyPromise.catch(() => {}); // Unhandled rejection 抑止
     return cvReadyPromise;
   }
   // OpenCV.js はサイズが大きく（〜10MB）WASM 初期化でメインスレッドが一瞬重くなる。
