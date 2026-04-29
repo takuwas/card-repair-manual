@@ -76,14 +76,24 @@
       mangle: false,
     });
 
-    // 見出しに対するアンカー ID 生成（日本語対応）
+    // 見出しに対するアンカー ID 生成（日本語対応 + Chapter/Section 短縮）
     const slugify = (text) => {
-      return text
-        .toString()
+      const s = text.toString();
+
+      // パターン1: "Chapter 5. 機材ガイド" や "Chapter 0.1. ..." → "chapter-5", "chapter-0-1"
+      let m = s.match(/^\s*Chapter\s+(\d+(?:\.\d+)*)/i);
+      if (m) return 'chapter-' + m[1].replace(/\./g, '-');
+
+      // パターン2: "5.1 機材選定の原則" や "6.8.1 標準サイクル..." → "section-5-1", "section-6-8-1"
+      m = s.match(/^\s*(\d+(?:\.\d+)*)\s/);
+      if (m) return 'section-' + m[1].replace(/\./g, '-');
+
+      // デフォルト: 日本語対応の汎用 slugify
+      return s
         .toLowerCase()
         .trim()
         .replace(/[\s　]+/g, '-')
-        .replace(/[\/\\?%*:|"<>#&（）()「」【】、。,．!！?？]/g, '')
+        .replace(/[\/\\?%*:|"<>#&（）()「」【】、。,．!！?？.]/g, '')
         .replace(/-+/g, '-')
         .replace(/^-|-$/g, '');
     };
@@ -142,6 +152,9 @@
 
     // スクロールに応じた TOC ハイライト
     setupScrollSpy();
+
+    // 全ての内部ハッシュリンクのクリック処理を設定
+    setupHashLinkHandlers();
   }
 
   // -------- Callout 検出 --------
@@ -194,21 +207,42 @@
     $toc.innerHTML = '';
     $toc.appendChild(ul);
 
-    // クリック時にモバイルでサイドバー閉じる
-    $toc.querySelectorAll('a').forEach(a => {
-      a.addEventListener('click', (e) => {
-        if (window.innerWidth <= 900) {
-          closeSidebar();
-        }
-        // クリック後、:target を再発火させるため、一度ハッシュを外して再設定
-        const targetId = a.dataset.target;
-        if (targetId) {
-          e.preventDefault();
-          history.pushState(null, '', '#' + targetId);
-          // hashchange を強制的に発火させる
-          window.dispatchEvent(new HashChangeEvent('hashchange'));
-        }
-      });
+  }
+
+  // -------- 全ての内部ハッシュリンク (#xxx) を統一処理 --------
+  // サイドバーTOC、本文中のMarkdownリンク、見出しの#アンカー、すべて対応
+  function setupHashLinkHandlers() {
+    document.body.addEventListener('click', (e) => {
+      const a = e.target.closest('a[href^="#"]');
+      if (!a) return;
+
+      const href = a.getAttribute('href');
+      if (!href || href === '#') return;
+
+      // 検索結果モーダル内のリンクは別ハンドラで処理済み
+      if (a.closest('#search-results')) return;
+
+      const targetId = decodeURIComponent(href.slice(1));
+      const target = document.getElementById(targetId);
+      if (!target) return; // ターゲットが存在しないリンクは無視（ブラウザデフォルトに任せる）
+
+      e.preventDefault();
+
+      // モバイルでサイドバー内のリンクをクリックしたら閉じる
+      if (window.innerWidth <= 900 && a.closest('.sidebar')) {
+        closeSidebar();
+      }
+
+      // 同じ要素をもう一度クリックしてもアニメーション再発火するようハッシュ更新
+      if (location.hash === '#' + targetId) {
+        // 既に同じハッシュ → 一旦外して再設定
+        history.replaceState(null, '', location.pathname + location.search);
+        history.pushState(null, '', '#' + targetId);
+      } else {
+        history.pushState(null, '', '#' + targetId);
+      }
+      // hashchange を強制発火（pushState は自動発火しない）
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
     });
   }
 
@@ -216,7 +250,8 @@
   window.addEventListener('hashchange', () => {
     const hash = location.hash;
     if (!hash) return;
-    const target = document.querySelector(hash);
+    // getElementById は Unicode ID も問題なく扱える（CSS selectorパースを通さないため）
+    const target = document.getElementById(decodeURIComponent(hash.slice(1)));
     if (!target) return;
 
     // 既に :target になっている要素のアニメーションをリセット
