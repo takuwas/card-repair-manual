@@ -315,8 +315,9 @@
     })();
     return cvReadyPromise;
   }
-  // 即座にロードを開始
-  waitForOpenCV().catch(err => console.warn('[diagnose] OpenCV load:', err.message));
+  // 注意: OpenCV.js は重いWASM（10-15MB）でロード時にメインスレッドを長時間ブロックする可能性がある。
+  // そのため、自動ロードせず、ユーザーがアップロード/サンプル選択した時のみ起動する。
+  // → handleFile() 内で waitForOpenCV() が呼ばれた時に初めてロードを開始する
 
   // ============================================================
   // アップロード関連
