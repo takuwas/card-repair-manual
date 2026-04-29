@@ -260,27 +260,39 @@
 
   function waitForOpenCVRuntime(timeoutMs) {
     return new Promise((resolve, reject) => {
-      const start = Date.now();
-      function check() {
+      let done = false;
+
+      // 確実なタイムアウト（onRuntimeInitialized コールバック待ちで止まらないように
+      // setTimeout ベースで強制的に reject する）
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        reject(new Error('runtime init timeout'));
+      }, timeoutMs);
+
+      function poll() {
+        if (done) return;
+        // 1. 完全に初期化済み？
         if (window.cv && typeof window.cv.Mat === 'function') {
+          done = true;
+          clearTimeout(timer);
           resolve(window.cv);
           return;
         }
-        if (window.cv && window.cv.onRuntimeInitialized !== undefined) {
+        // 2. ファストパス: onRuntimeInitialized コールバックも登録しておく
+        //    （コールバックが発火しなくても下のポーリングで救える）
+        if (window.cv && window.cv.onRuntimeInitialized !== undefined && !window.cv._hookedByDiagnose) {
+          window.cv._hookedByDiagnose = true;
           const prev = window.cv.onRuntimeInitialized;
           window.cv.onRuntimeInitialized = () => {
             if (typeof prev === 'function') { try { prev(); } catch (_) {} }
-            resolve(window.cv);
+            // ポーリングがすぐ次の200msで拾うので resolve はそちらに任せる
           };
-          return;
         }
-        if (Date.now() - start > timeoutMs) {
-          reject(new Error('runtime init timeout'));
-          return;
-        }
-        setTimeout(check, 200);
+        // 3. ポーリング継続（onRuntimeInitialized が無音失敗してもこちらで救える）
+        setTimeout(poll, 200);
       }
-      check();
+      poll();
     });
   }
 
