@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="カード損傷アノテーション収集ツール - 機械学習用の教師データを人手で作成">
+  <title>📝 アノテーション収集 | ポケモンカード修復マニュアル</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="annotate.css">
+
+  <!-- DOMPurify (既存サイトと同じくサニタイズ用) -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
+  <!-- JSZip (ZIPエクスポート) -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <button id="sidebar-toggle" class="sidebar-toggle" aria-label="サイドバーを開く">☰</button>
+  <h1 class="topbar-title">📘 ポケモンカード修復マニュアル <span class="topbar-subtitle">／ 📝 アノテーション収集</span></h1>
+  <div class="topbar-actions">
+    <a href="index.html" class="topbar-nav-link" aria-label="マニュアル本体へ" title="マニュアル本体">
+      <span class="topbar-nav-icon" aria-hidden="true">📖</span><span class="topbar-nav-label">マニュアル</span>
+    </a>
+    <a href="diagnose.html" class="topbar-nav-link" aria-label="画像診断ページへ" title="画像診断ページ">
+      <span class="topbar-nav-icon" aria-hidden="true">📷</span><span class="topbar-nav-label">診断（β）</span>
+    </a>
+    <a href="annotate.html" class="topbar-nav-link active" aria-label="アノテーション収集ページ（現在表示中）" title="アノテーション収集ページ" aria-current="page">
+      <span class="topbar-nav-icon" aria-hidden="true">📝</span><span class="topbar-nav-label">アノテーション</span>
+    </a>
+    <button id="theme-toggle" class="theme-toggle" aria-label="ダークモード切替">🌙</button>
+  </div>
+</header>
+
+<div class="annot-layout">
+
+  <!-- ============================================================
+       サイドバー: 画像リスト + 統計 + エクスポート
+       ============================================================ -->
+  <aside id="annot-sidebar" class="annot-sidebar" aria-label="画像リストと統計">
+
+    <div class="annot-sidebar-section">
+      <div class="annot-sidebar-header">
+        <h2 class="annot-sidebar-title">🖼️ 画像</h2>
+        <button type="button" class="btn btn-primary btn-sm" id="btn-add-image" aria-label="画像を追加">＋ 追加</button>
+      </div>
+      <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" multiple hidden>
+      <ul id="image-list" class="image-list" aria-live="polite">
+        <li class="image-list-empty">画像をアップロードしてください</li>
+      </ul>
+    </div>
+
+    <div class="annot-sidebar-section">
+      <h2 class="annot-sidebar-title">📊 統計</h2>
+      <div class="stats-grid">
+        <div class="stats-cell">
+          <span class="stats-num" id="stat-image-count">0</span>
+          <span class="stats-label">画像</span>
+        </div>
+        <div class="stats-cell">
+          <span class="stats-num" id="stat-annot-count">0</span>
+          <span class="stats-label">アノテ</span>
+        </div>
+        <div class="stats-cell">
+          <span class="stats-num" id="stat-annotated-images">0</span>
+          <span class="stats-label">注釈済</span>
+        </div>
+      </div>
+      <div class="stats-bars" id="stats-bars" aria-label="損傷タイプ別件数">
+        <p class="stats-empty">損傷タイプの集計はここに表示されます</p>
+      </div>
+    </div>
+
+    <div class="annot-sidebar-section">
+      <h2 class="annot-sidebar-title">💾 エクスポート</h2>
+      <div class="export-buttons">
+        <button type="button" class="btn btn-primary btn-block" id="btn-export-zip" aria-label="ZIP形式でエクスポート (COCO + YOLO)">📦 ZIP (COCO+YOLO)</button>
+        <button type="button" class="btn btn-secondary btn-block" id="btn-export-json" aria-label="JSON形式でエクスポート">📄 JSON のみ</button>
+        <button type="button" class="btn btn-secondary btn-block" id="btn-export-yolo" aria-label="YOLO形式でエクスポート">🎯 YOLO のみ</button>
+        <hr class="sep">
+        <button type="button" class="btn btn-tertiary btn-block" id="btn-import" aria-label="アノテーションをインポート">📥 インポート (ZIP/JSON)</button>
+        <input type="file" id="import-input" accept=".zip,.json,application/json,application/zip" hidden>
+        <button type="button" class="btn btn-tertiary btn-block" id="btn-clear-all" aria-label="全データを削除">🗑️ 全データ削除</button>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ============================================================
+       メインエリア: ツールパレット + Canvas + アノテーションリスト
+       ============================================================ -->
+  <main class="annot-main" id="annot-main">
+
+    <!-- 空状態 -->
+    <section id="empty-state" class="empty-state" hidden>
+      <div class="empty-icon" aria-hidden="true">📥</div>
+      <h2>画像をアップロードして始めましょう</h2>
+      <p>左サイドバーの「＋ 追加」ボタン、またはこの領域へ画像をドラッグ&ドロップしてください</p>
+      <p class="muted">人間が教師として損傷箇所をラベル付けし、ZIP/COCO/YOLO 形式で書き出して機械学習に使えます。</p>
+    </section>
+
+    <!-- ツールパレット -->
+    <section id="tool-bar" class="tool-bar" hidden>
+
+      <div class="tool-bar-row">
+
+        <div class="tool-group" role="toolbar" aria-label="描画ツール">
+          <button type="button" class="tool-btn" data-tool="rect" aria-label="矩形ツール (R)" title="矩形 (R)">
+            <span class="tool-icon">▭</span><span class="tool-label">矩形</span>
+          </button>
+          <button type="button" class="tool-btn" data-tool="brush" aria-label="ブラシツール (B)" title="ブラシ (B)">
+            <span class="tool-icon">🖌</span><span class="tool-label">ブラシ</span>
+          </button>
+          <button type="button" class="tool-btn" data-tool="polygon" aria-label="多角形ツール (P)" title="多角形 (P)">
+            <span class="tool-icon">⬡</span><span class="tool-label">多角形</span>
+          </button>
+          <button type="button" class="tool-btn" data-tool="eraser" aria-label="消しゴム (E)" title="消しゴム: クリックで該当アノテーション削除 (E)">
+            <span class="tool-icon">🩹</span><span class="tool-label">消しゴム</span>
+          </button>
+        </div>
+
+        <div class="tool-group" id="brush-controls" hidden>
+          <label class="brush-label">ブラシサイズ
+            <input type="range" id="brush-size" min="5" max="80" value="20" aria-label="ブラシサイズ">
+            <span id="brush-size-val">20</span>px
+          </label>
+        </div>
+
+        <div class="tool-group">
+          <label class="tool-label-inline">損傷タイプ
+            <select id="damage-type-select" aria-label="現在選択中の損傷タイプ"></select>
+          </label>
+        </div>
+
+        <div class="tool-group">
+          <label class="tool-label-inline">ズーム
+            <input type="range" id="zoom-slider" min="0.5" max="3" step="0.1" value="1" aria-label="ズーム">
+            <span id="zoom-val">100%</span>
+          </label>
+          <button type="button" class="btn btn-tertiary btn-sm" id="btn-fit" aria-label="画面に合わせる">⊡ Fit</button>
+        </div>
+
+        <div class="tool-group">
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-undo" aria-label="元に戻す (Ctrl+Z)">↶ 戻す</button>
+          <button type="button" class="btn btn-danger btn-sm" id="btn-clear-image" aria-label="この画像のアノテーション全削除">🗑️ 全消し</button>
+        </div>
+
+      </div>
+
+      <div class="tool-hint" id="tool-hint">ツールを選択してください</div>
+    </section>
+
+    <!-- Canvas エリア -->
+    <section id="canvas-section" class="canvas-section" hidden>
+      <div class="canvas-stage" id="canvas-stage" role="img" aria-label="アノテーション対象画像">
+        <canvas id="canvas-image" class="canvas-layer canvas-image"></canvas>
+        <canvas id="canvas-annotations" class="canvas-layer canvas-annotations"></canvas>
+        <canvas id="canvas-draw" class="canvas-layer canvas-draw"></canvas>
+      </div>
+      <div class="canvas-meta">
+        <span id="canvas-meta-text">—</span>
+      </div>
+    </section>
+
+    <!-- アノテーションリスト -->
+    <section id="annot-list-section" class="annot-list-section" hidden>
+      <div class="annot-list-header">
+        <h2>📋 この画像のアノテーション <span id="annot-count-badge" class="annot-count-badge">0</span></h2>
+      </div>
+      <div id="annot-list" class="annot-list" aria-live="polite">
+        <p class="annot-list-empty">まだアノテーションがありません。ツールを選択して描画してください。</p>
+      </div>
+    </section>
+
+  </main>
+
+</div>
+
+<!-- ============================================================
+     ラベル入力モーダル
+     ============================================================ -->
+<div id="label-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="label-modal-title">
+  <div class="modal-backdrop" data-close-modal="label-modal"></div>
+  <div class="modal-dialog">
+    <header class="modal-header">
+      <h2 id="label-modal-title">🏷️ 損傷ラベルを入力</h2>
+      <button type="button" class="modal-close" data-close-modal="label-modal" aria-label="閉じる">×</button>
+    </header>
+    <div class="modal-body">
+      <div class="modal-preview">
+        <canvas id="modal-preview-canvas" aria-label="アノテーション領域のプレビュー"></canvas>
+        <div class="modal-preview-info">
+          <span id="modal-preview-shape">—</span>
+          <span id="modal-preview-size">—</span>
+        </div>
+      </div>
+      <form id="label-form" class="label-form">
+        <div class="form-row">
+          <label for="form-damage-type">損傷タイプ <span class="req">*</span></label>
+          <select id="form-damage-type" required></select>
+        </div>
+        <div class="form-row">
+          <label>重症度 <span class="req">*</span></label>
+          <div class="radio-group" role="radiogroup">
+            <label class="radio-pill"><input type="radio" name="severity" value="mild"> 軽度</label>
+            <label class="radio-pill"><input type="radio" name="severity" value="moderate" checked> 中度</label>
+            <label class="radio-pill"><input type="radio" name="severity" value="severe"> 重度</label>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="form-confidence">アノテーター自信度: <span id="form-confidence-val">3</span> / 5</label>
+          <input type="range" id="form-confidence" min="1" max="5" step="1" value="3" aria-label="アノテーター自信度">
+          <small class="form-hint">5 = 完全に確信 / 1 = 自信なし</small>
+        </div>
+        <div class="form-row">
+          <label for="form-notes">メモ（任意）</label>
+          <textarea id="form-notes" rows="3" placeholder="例: 中央右寄り、ホロ層下に到達せず"></textarea>
+        </div>
+      </form>
+    </div>
+    <footer class="modal-footer">
+      <button type="button" class="btn btn-tertiary" data-close-modal="label-modal" id="btn-cancel-label">キャンセル</button>
+      <button type="button" class="btn btn-primary" id="btn-save-label">💾 保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ============================================================
+     確認モーダル (汎用)
+     ============================================================ -->
+<div id="confirm-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+  <div class="modal-backdrop" data-close-modal="confirm-modal"></div>
+  <div class="modal-dialog modal-dialog-sm">
+    <header class="modal-header">
+      <h2 id="confirm-modal-title">確認</h2>
+    </header>
+    <div class="modal-body">
+      <p id="confirm-modal-message">本当に実行しますか？</p>
+    </div>
+    <footer class="modal-footer">
+      <button type="button" class="btn btn-tertiary" data-close-modal="confirm-modal" id="btn-confirm-cancel">キャンセル</button>
+      <button type="button" class="btn btn-danger" id="btn-confirm-ok">OK</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ============================================================
+     トースト
+     ============================================================ -->
+<div id="toast-container" class="toast-container" aria-live="assertive" aria-atomic="true"></div>
+
+<footer class="footer">
+  <p>
+    出典: <a href="https://discord.gg/" target="_blank" rel="noopener">CRS Discord「ポケカリペア」</a>
+    ｜ <a href="index.html">📘 マニュアル本体へ</a>
+    ｜ Annotate v0.1.0
+  </p>
+</footer>
+
+<script src="annotate.js" defer></script>
+</body>
+</html>

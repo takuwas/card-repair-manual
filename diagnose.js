@@ -91,7 +91,7 @@
       { name: 'footer',      y1: 0.93, y2: 1.00 },  // 弱点・コレクター情報
     ],
     artworkZone: { y1: 0.18, y2: 0.55 },  // アートワーク中央
-    confidenceFloor: 0.18,  // これ未満は棄却
+    confidenceFloor: 0.12,  // これ未満は棄却（baseline検出の最低品質）
     nmsIoU: 0.5,
   };
 
@@ -137,6 +137,7 @@
   let currentImage = null;        // HTMLImageElement
   let currentResult = null;       // 検出結果 JSON
   let currentDetections = [];     // 描画用（ピクセル座標）
+  let currentCenteringOverlayEnabled = true;
   let cvReady = false;
   let cvLoadFailed = false;
   let cvReadyPromise = null;
@@ -590,6 +591,9 @@
     try {
       src = cv.imread(inputCanvas);
 
+      // 撮影品質の判定（正面化前の元画像で）
+      const imageQuality = safeCall(() => assessImageQuality(src), 'assessImageQuality') || { warnings: [], metrics: {} };
+
       // 反り検出（正面化前の画像で行う）
       const warpResult = safeCall(() => detectWarp(src), 'detectWarp');
 
@@ -606,16 +610,25 @@
       // 照明正規化
       safeCall(() => normalizeIllumination(rect), 'normalizeIllumination');
 
+      // ホログラム検出（中央のアートワーク領域で）
+      const holoInfo = safeCall(() => detectHolographic(rect), 'detectHolographic') || { is_holographic: false };
+
+      // センタリング採点（内枠検出 → 比率計算）
+      showProgress(58, 'センタリングを採点中', 2);
+      await new Promise(r2 => setTimeout(r2, 20));
+      const innerFrame = safeCall(() => detectInnerFrame(rect), 'detectInnerFrame');
+      const centering = innerFrame ? safeCall(() => computeCentering(innerFrame), 'computeCentering') : null;
+
       // 各損傷を検出
-      showProgress(60, '折れ目を検出中', 3);
+      showProgress(62, '折れ目を検出中', 3);
       await new Promise(r2 => setTimeout(r2, 20));
       const creases = safeCall(() => detectCreases(rect), 'detectCreases') || [];
 
-      showProgress(68, '凹みを検出中', 3);
+      showProgress(70, '凹みを検出中', 3);
       await new Promise(r2 => setTimeout(r2, 20));
       const indents = safeCall(() => detectIndents(rect), 'detectIndents') || [];
 
-      showProgress(74, '角の損傷を検出中', 3);
+      showProgress(75, '角の損傷を検出中', 3);
       await new Promise(r2 => setTimeout(r2, 20));
       const corners = safeCall(() => detectCornerDamage(rect), 'detectCornerDamage') || [];
 
@@ -623,8 +636,23 @@
       await new Promise(r2 => setTimeout(r2, 20));
       const stains = safeCall(() => detectStains(rect), 'detectStains') || [];
 
-      const damages = [...creases, ...indents, ...corners, ...stains];
+      let damages = [...creases, ...indents, ...corners, ...stains];
       if (warpResult && warpResult.severity) damages.push(warpResult);
+
+      // === 信頼度ポストプロセス（精度向上のキモ） ===
+      // 1) レイアウトマスクで信頼度を減衰（テキスト/ホロ領域の誤検出抑制）
+      damages.forEach(d => applyLayoutMask(d, holoInfo));
+      // 2) 撮影品質警告に応じた信頼度補正
+      if (imageQuality.warnings && imageQuality.warnings.includes('motion_blur')) {
+        damages.forEach(d => { d.confidence = (d.confidence || 0) * 0.8; });
+      }
+      if (imageQuality.warnings && imageQuality.warnings.includes('low_contrast')) {
+        damages.forEach(d => { d.confidence = (d.confidence || 0) * 0.9; });
+      }
+      // 3) 信頼度フロア未満は棄却
+      damages = damages.filter(d => (d.confidence || 0) >= DETECT_PARAMS.confidenceFloor);
+      // 4) NMS（同タイプ内の重複統合）
+      damages = applyNMS(damages, DETECT_PARAMS.nmsIoU);
 
       // ID 付与・ラベル整形
       damages.forEach((d, i) => {
@@ -658,8 +686,8 @@
       src.delete(); rect.delete();
       src = null; rect = null;
 
-      // 結果 JSON 構築
-      return buildResultJSON(img, file, damages);
+      // 結果 JSON 構築（拡張: image quality / holo / centering）
+      return buildResultJSON(img, file, damages, { imageQuality, holoInfo, centering });
     } catch (err) {
       // エラー時はマット解放
       try { if (src) src.delete(); } catch (_) {}
@@ -803,7 +831,7 @@
     return rectMat;
   }
 
-  // ----- §4.3 折れ目検出 (HoughLinesP) -----
+  // ----- §4.3 折れ目検出 (HoughLinesP + マルチ特徴信頼度) -----
   function detectCreases(rectMat) {
     const cv = window.cv;
     const gray = new cv.Mat();
@@ -812,8 +840,11 @@
     const filtered = new cv.Mat();
     cv.bilateralFilter(gray, filtered, 9, 75, 75);
 
+    // 適応的閾値: Cannyの上下限を画像のメディアンから動的決定
+    const cannyTh = computeAdaptiveCannyThresholds(filtered);
+
     const edges = new cv.Mat();
-    cv.Canny(filtered, edges, 30, 100);
+    cv.Canny(filtered, edges, cannyTh.low, cannyTh.high);
 
     const lines = new cv.Mat();
     cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 50, 60, 10);
@@ -834,11 +865,27 @@
       const yMid = (y1 + y2) / 2 / H;
       if (yMid < 0.07 || yMid > 0.93) continue;
 
+      // マルチ特徴信頼度
+      // - straightness: 直線性（HoughLinesP出力なので高めだが、長さで近似）
+      // - brightness_diff: 線の上下で輝度差があるか（折れ目は隣接が明暗反転する）
+      // - continuity: 線の長さ（連続性の代理指標）
+      const features = computeCreaseFeatures(filtered, x1, y1, x2, y2);
+      features.continuity = clamp01(lengthMm / 60);
+      features.length_mm = lengthMm;
+      const mfConf = combineConfidences({
+        straightness: features.straightness,
+        brightness_diff: features.brightness_diff,
+        continuity: features.continuity,
+      });
+      if (mfConf <= 0) continue;
+
       let severity = 'light';
       if (lengthMm >= 30) severity = 'severe';
       else if (lengthMm >= 10) severity = 'moderate';
 
-      const confidence = Math.min(1.0, lengthMm / 60);
+      // confidence は従来式と特徴量の幾何平均を使用（より厳しい側に寄せる）
+      const baseConf = Math.min(1.0, lengthMm / 60);
+      const confidence = Math.sqrt(baseConf * mfConf);
 
       results.push({
         type: 'crease',
@@ -846,6 +893,7 @@
         length_mm: lengthMm,
         severity,
         confidence,
+        features,
         geom: {
           kind: 'polyline',
           points_norm: [[x1 / W, y1 / H], [x2 / W, y2 / H]],
@@ -855,6 +903,87 @@
 
     gray.delete(); filtered.delete(); edges.delete(); lines.delete();
     return mergeNearbyLines(results).slice(0, 10); // 表示上限
+  }
+
+  // メディアンベースの自動 Canny 閾値（Otsu/median）
+  function computeAdaptiveCannyThresholds(grayMat) {
+    try {
+      const cv = window.cv;
+      const data = grayMat.data;
+      // サンプリング（ダウンサンプリングで高速化）
+      const step = Math.max(1, Math.floor(data.length / 10000));
+      const sample = [];
+      for (let i = 0; i < data.length; i += step) sample.push(data[i]);
+      sample.sort((a, b) => a - b);
+      const median = sample[Math.floor(sample.length / 2)] || 128;
+      const sigma = 0.33;
+      const low = Math.max(0, Math.floor((1 - sigma) * median));
+      const high = Math.min(255, Math.floor((1 + sigma) * median));
+      return { low: Math.max(20, low), high: Math.min(220, Math.max(low + 30, high)) };
+    } catch (_) {
+      return { low: 30, high: 100 };
+    }
+  }
+
+  // 折れ目候補ラインの局所特徴: 線の両側の輝度差・直線性
+  function computeCreaseFeatures(grayMat, x1, y1, x2, y2) {
+    const W = grayMat.cols, H = grayMat.rows;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy) || 1;
+    // 線の法線方向ベクトル
+    const nx = -dy / len, ny = dx / len;
+    const SAMPLES = 24;
+    const offset = 4;  // 法線方向のオフセット（px）
+    let darkSum = 0, lightSum = 0, samples = 0;
+    let darkVar = 0, lightVar = 0;
+    let validDiff = 0;
+    for (let i = 1; i < SAMPLES - 1; i++) {
+      const t = i / SAMPLES;
+      const px = x1 + dx * t;
+      const py = y1 + dy * t;
+      const lx = Math.round(px - nx * offset);
+      const ly = Math.round(py - ny * offset);
+      const rx = Math.round(px + nx * offset);
+      const ry = Math.round(py + ny * offset);
+      const cx = Math.round(px), cy = Math.round(py);
+      if (lx < 0 || lx >= W || ly < 0 || ly >= H) continue;
+      if (rx < 0 || rx >= W || ry < 0 || ry >= H) continue;
+      if (cx < 0 || cx >= W || cy < 0 || cy >= H) continue;
+      const lv = grayMat.ucharAt(ly, lx);
+      const rv = grayMat.ucharAt(ry, rx);
+      const cv2 = grayMat.ucharAt(cy, cx);
+      // 中心が両側より暗い（折れ目の谷）or 明るい（折れ目の山）→ どちらでも有効
+      const sideMean = (lv + rv) / 2;
+      const diff = Math.abs(cv2 - sideMean);
+      validDiff += diff;
+      darkSum += Math.min(lv, rv);
+      lightSum += Math.max(lv, rv);
+      samples++;
+    }
+    if (samples < 4) return { straightness: 0, brightness_diff: 0 };
+    const meanDiff = validDiff / samples;
+    // 0-1 にスケール（典型的な折れ目で 8-30 程度の差）
+    const brightness_diff = clamp01((meanDiff - 4) / 25);
+    // straightness: HoughLinesP の出力は概ね直線。長さに対する逸脱は計測コスト高なので、サンプル間の安定度を代理に。
+    const straightness = 0.85; // baseline（HoughLinesP前提で固定値、十分に直線）
+    return { straightness, brightness_diff, mean_intensity_diff: meanDiff };
+  }
+
+  function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+
+  // マルチ特徴信頼度: 1つでも極端に低ければ棄却、それ以外は重み付き平均
+  function combineConfidences(features, weights) {
+    const keys = Object.keys(features);
+    if (keys.length === 0) return 0;
+    const values = keys.map(k => features[k]);
+    if (values.some(v => v < 0.18)) return 0;  // 弱い特徴があれば棄却
+    let sum = 0, wsum = 0;
+    keys.forEach(k => {
+      const w = (weights && weights[k]) || 1;
+      sum += features[k] * w;
+      wsum += w;
+    });
+    return clamp01(sum / wsum);
   }
 
   function mergeNearbyLines(lines) {
@@ -974,12 +1103,28 @@
       if (avgDark >= 30 || areaMm2 >= 150) severity = 'severe';
       else if (avgDark >= 15 || areaMm2 >= 30) severity = 'moderate';
 
+      // マルチ特徴: 局所明度減 / アスペクト比 / 形状の凸性近似
+      const aspect = w > 0 && h > 0 ? Math.min(w, h) / Math.max(w, h) : 0;
+      const fillRatio = (w * h) > 0 ? area / (w * h) : 0;  // bbox 内の塗り率（凸性の代理）
+      const features = {
+        intensity_drop: clamp01(avgDark / 35),
+        compactness:    clamp01(aspect),       // 細長すぎる線状は凹みでない
+        convexity:      clamp01(fillRatio * 1.3),
+      };
+      const mfConf = combineConfidences(features);
+      if (mfConf <= 0) continue;
+
+      // 従来式と組み合わせ
+      const baseConf = Math.min(1.0, avgDark / 40);
+      const confidence = Math.sqrt(baseConf * mfConf);
+
       results.push({
         type: 'indent',
         severity,
-        confidence: Math.min(1.0, avgDark / 40),
+        confidence,
+        features,
         bbox: { x, y, w, h },
-        metrics: { area_mm2: areaMm2, avg_intensity: avgDark },
+        metrics: { area_mm2: areaMm2, avg_intensity: avgDark, fill_ratio: fillRatio, aspect },
         geom: {
           kind: 'bbox',
           norm: [x / W, y / H, (x + w) / W, (y + h) / H],
@@ -1094,11 +1239,25 @@
       if (areaMm2 > 50) severity = 'severe';
       else if (areaMm2 > 15) severity = 'moderate';
 
+      // マルチ特徴: 面積 / 連続性（fill ratio） / アスペクト比
+      const fillRatio = (r.width * r.height) > 0 ? area / (r.width * r.height) : 0;
+      const aspect = (r.width > 0 && r.height > 0) ? Math.min(r.width, r.height) / Math.max(r.width, r.height) : 0;
+      const features = {
+        area:          clamp01(areaMm2 / 80),
+        connectedness: clamp01(fillRatio * 1.4),
+        compactness:   clamp01(aspect * 1.5),
+      };
+      const mfConf = combineConfidences(features);
+      if (mfConf <= 0) continue;
+      const baseConf = Math.min(1.0, areaMm2 / 100);
+      const confidence = Math.sqrt(baseConf * mfConf);
+
       results.push({
         type: 'stain',
         severity,
-        confidence: Math.min(1.0, areaMm2 / 100),
-        metrics: { area_mm2: areaMm2 },
+        confidence,
+        features,
+        metrics: { area_mm2: areaMm2, fill_ratio: fillRatio, aspect },
         geom: {
           kind: 'bbox',
           norm: [r.x / W, r.y / Ht, (r.x + r.width) / W, (r.y + r.height) / Ht],
@@ -1182,14 +1341,31 @@
   // ============================================================
   // 結果 JSON 構築
   // ============================================================
-  function buildResultJSON(img, file, detections) {
+  function buildResultJSON(img, file, detections, extras) {
+    extras = extras || {};
+    const imageQuality = extras.imageQuality || { warnings: [], metrics: {} };
+    const holoInfo = extras.holoInfo || { is_holographic: false };
+    const centering = extras.centering || null;
+
     const order = { mild: 0, light: 1, moderate: 2, severe: 3, critical: 4 };
     const highest = detections.reduce((acc, d) => order[d.severity] > order[acc] ? d.severity : acc, 'mild');
     const overall = detections.length ? avg(detections.map(d => d.confidence)) : 0;
 
+    // 撮影品質の警告を JSON に組み込む
+    const qualityWarnings = (imageQuality.warnings || []).map(code => ({
+      code,
+      message: ({
+        too_dark:      '画像が暗すぎます。明るい場所で再撮影をお勧めします。',
+        too_bright:    '画像が明るすぎます（白飛びの可能性）。',
+        low_contrast:  'コントラストが不足しています。背景とのコントラストを確保してください。',
+        motion_blur:   '画像がブレている可能性があります。',
+      }[code]) || code,
+    }));
+    const noDetectWarn = detections.length === 0 ? [{ code: 'no_detections', message: '損傷は検出されませんでした。' }] : [];
+
     return {
-      schema_version: '1.0',
-      engine: { name: 'heuristic-cv', version: '0.1.0', is_demo: true, model_loaded_at: new Date().toISOString() },
+      schema_version: '1.1',
+      engine: { name: 'heuristic-cv', version: '0.2.0', is_demo: true, model_loaded_at: new Date().toISOString() },
       diagnosed_at: new Date().toISOString(),
       image: {
         filename: file.name, mime: file.type,
@@ -1197,6 +1373,32 @@
         card_bbox: null, card_corners: null,
         orientation: img.naturalWidth > img.naturalHeight ? 'landscape' : 'portrait',
         side: 'front',
+        quality: {
+          warnings: imageQuality.warnings || [],
+          metrics: imageQuality.metrics || {},
+        },
+      },
+      card: {
+        is_holographic: !!holoInfo.is_holographic,
+        holo_score: holoInfo.score || 0,
+        centering: centering ? {
+          available: true,
+          horizontal: {
+            left_px: centering.horizontal.leftPx,
+            right_px: centering.horizontal.rightPx,
+            ratio_label: centering.horizontal.label,
+            deviation_pct: centering.horizontal.deviation,
+          },
+          vertical: {
+            top_px: centering.vertical.topPx,
+            bottom_px: centering.vertical.bottomPx,
+            ratio_label: centering.vertical.label,
+            deviation_pct: centering.vertical.deviation,
+          },
+          estimated_grade: centering.estimatedGrade,
+          score_0_100: centering.overallScore,
+          annotation: centering.annotation,
+        } : { available: false },
       },
       detections,
       summary: {
@@ -1214,7 +1416,7 @@
         ],
       },
       errors: [],
-      warnings: detections.length === 0 ? [{ code: 'no_detections', message: '損傷は検出されませんでした。' }] : [],
+      warnings: [...noDetectWarn, ...qualityWarnings],
     };
   }
 
@@ -1225,13 +1427,23 @@
   // ============================================================
   function renderResults(result) {
     currentDetections = result.detections;
-    drawCanvas(currentImage, result.detections);
+    drawCanvas(currentImage, result.detections, result.card && result.card.centering);
 
     if (metaCount)      metaCount.textContent = result.summary.total_detections;
     if (metaConfidence) metaConfidence.textContent = result.summary.total_detections
       ? Math.round(result.summary.overall_confidence * 100) + '%'
       : '—';
     if (metaEngine) metaEngine.textContent = `${result.engine.name} v${result.engine.version}`;
+
+    // ホログラム pill
+    const holoPill = document.getElementById('meta-holo-pill');
+    if (holoPill) holoPill.hidden = !(result.card && result.card.is_holographic);
+
+    // 撮影品質警告
+    renderQualityWarnings(result);
+
+    // センタリング採点セクション
+    renderCenteringSection(result.card && result.card.centering);
 
     if (detectionCount) detectionCount.textContent = `(${result.summary.total_detections} 件)`;
     if (detectionList) detectionList.innerHTML = '';
@@ -1256,6 +1468,104 @@
         .map(l => `<li><a href="index.html${escapeAttr(l.href)}" target="_blank" rel="noopener">📖 ${escapeHTML(l.label)}</a></li>`)
         .join('');
       primaryChapterLinks.innerHTML = sanitize(html);
+    }
+  }
+
+  function renderQualityWarnings(result) {
+    const wrapper = document.getElementById('quality-warnings');
+    const list = document.getElementById('quality-warnings-list');
+    if (!wrapper || !list) return;
+    const qWarnings = (result.warnings || []).filter(w => w.code !== 'no_detections');
+    if (!qWarnings.length) {
+      wrapper.hidden = true;
+      return;
+    }
+    list.innerHTML = qWarnings
+      .map(w => `<li>${escapeHTML(w.message)}</li>`)
+      .join('');
+    wrapper.hidden = false;
+  }
+
+  function renderCenteringSection(centering) {
+    const section = document.getElementById('centering-section');
+    if (!section) return;
+    if (!centering || !centering.available) {
+      section.hidden = true;
+      return;
+    }
+    section.hidden = false;
+
+    const setText = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+    setText('centering-h-label', centering.horizontal.ratio_label);
+    setText('centering-v-label', centering.vertical.ratio_label);
+    setText('centering-h-detail',
+      `左 ${Math.round(centering.horizontal.left_px)}px / 右 ${Math.round(centering.horizontal.right_px)}px ・ 偏差 ${centering.horizontal.deviation_pct.toFixed(1)}%`);
+    setText('centering-v-detail',
+      `上 ${Math.round(centering.vertical.top_px)}px / 下 ${Math.round(centering.vertical.bottom_px)}px ・ 偏差 ${centering.vertical.deviation_pct.toFixed(1)}%`);
+
+    // バー描画: 左右%/上下% を 0-100% にマッピング
+    const hFill = document.getElementById('centering-h-bar-fill');
+    const vFill = document.getElementById('centering-v-bar-fill');
+    if (hFill) {
+      const lp = centering.horizontal.deviation_pct; // 0..50
+      // バー: 中央線(50%)から左 or 右にズレを示す
+      const leftPercent = (centering.horizontal.left_px / (centering.horizontal.left_px + centering.horizontal.right_px)) * 100;
+      // バーの開始位置と幅: min(50, leftPercent) から max(50, leftPercent) まで
+      const start = Math.min(50, leftPercent);
+      const end   = Math.max(50, leftPercent);
+      hFill.style.left = start + '%';
+      hFill.style.width = (end - start) + '%';
+      hFill.classList.remove('dev-mid', 'dev-bad');
+      if (lp >= 15) hFill.classList.add('dev-bad');
+      else if (lp >= 7.5) hFill.classList.add('dev-mid');
+    }
+    if (vFill) {
+      const lp = centering.vertical.deviation_pct;
+      const topPercent = (centering.vertical.top_px / (centering.vertical.top_px + centering.vertical.bottom_px)) * 100;
+      const start = Math.min(50, topPercent);
+      const end   = Math.max(50, topPercent);
+      vFill.style.left = start + '%';
+      vFill.style.width = (end - start) + '%';
+      vFill.classList.remove('dev-mid', 'dev-bad');
+      if (lp >= 15) vFill.classList.add('dev-bad');
+      else if (lp >= 7.5) vFill.classList.add('dev-mid');
+    }
+
+    // グレードバッジ
+    const badge = document.getElementById('centering-grade-badge');
+    if (badge) {
+      badge.textContent = centering.estimated_grade;
+      badge.classList.remove('grade-9', 'grade-8', 'grade-7', 'grade-6', 'grade-5', 'grade-low');
+      const g = centering.estimated_grade || '';
+      if (g.includes('GEM MINT')) {/* default green */}
+      else if (g.includes('MINT 9')) badge.classList.add('grade-9');
+      else if (g.includes('NM-MT 8')) badge.classList.add('grade-8');
+      else if (g.includes('NM 7')) badge.classList.add('grade-7');
+      else if (g.includes('EX-MT 6')) badge.classList.add('grade-6');
+      else if (g.includes('EX 5')) badge.classList.add('grade-5');
+      else badge.classList.add('grade-low');
+    }
+    setText('centering-score-value', String(centering.score_0_100));
+
+    // 解説
+    const note = document.getElementById('centering-note');
+    if (note) {
+      const hd = centering.horizontal.deviation_pct.toFixed(1);
+      const vd = centering.vertical.deviation_pct.toFixed(1);
+      note.textContent = `左右の枠幅差は ${hd}%、上下は ${vd}% です。`
+        + ` 推定グレード ${centering.estimated_grade}（最も悪い軸を基準）。`
+        + ` ※ あくまで参考値で、PSA等の正式鑑定は別途必要です。`;
+    }
+
+    // オーバーレイトグル
+    const toggle = document.getElementById('centering-overlay-toggle');
+    if (toggle) {
+      toggle.onchange = () => {
+        currentCenteringOverlayEnabled = toggle.checked;
+        // 再描画
+        if (currentResult) drawCanvas(currentImage, currentResult.detections, currentResult.card && currentResult.card.centering);
+      };
+      currentCenteringOverlayEnabled = toggle.checked;
     }
   }
 
@@ -1329,7 +1639,7 @@
   // ============================================================
   // Canvas 描画
   // ============================================================
-  function drawCanvas(img, detections) {
+  function drawCanvas(img, detections, centering) {
     if (!canvasBase || !canvasOverlay) return;
     const ctxBase = canvasBase.getContext('2d');
     const ctxOver = canvasOverlay.getContext('2d');
@@ -1349,6 +1659,11 @@
     // → bbox_pixel は rect 座標系 (RECT_W x RECT_H)。元画像サイズへスケール
     const scaleX = cw / RECT_W;
     const scaleY = ch / RECT_H;
+
+    // センタリングオーバーレイを先に描画（損傷バッジが上に来るように）
+    if (centering && centering.available && currentCenteringOverlayEnabled) {
+      drawCenteringOverlay(canvasOverlay, centering, scaleX, scaleY);
+    }
 
     detections.forEach((d, i) => {
       drawDetectionOnImage(ctxOver, d, i + 1, scaleX, scaleY);
@@ -1477,9 +1792,14 @@
     const ctx = canvasOverlay.getContext('2d');
     const cw = canvasOverlay.width, ch = canvasOverlay.height;
     const sx = cw / RECT_W, sy = ch / RECT_H;
+    const centering = currentResult.card && currentResult.card.centering;
     let pulses = 0;
     const id = setInterval(() => {
       ctx.clearRect(0, 0, cw, ch);
+      // センタリングオーバーレイを再描画
+      if (centering && centering.available && currentCenteringOverlayEnabled) {
+        drawCenteringOverlay(canvasOverlay, centering, sx, sy);
+      }
       currentResult.detections.forEach((dd, i) => {
         const isTarget = dd.id === detId;
         ctx.globalAlpha = isTarget ? (pulses % 2 === 0 ? 1 : 0.45) : 0.6;
@@ -1610,6 +1930,504 @@
       return window.DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
     }
     return html;
+  }
+
+  // ============================================================
+  // 撮影品質判定（ヒストグラム + ラプラシアン分散）
+  // ============================================================
+  function assessImageQuality(srcMat) {
+    const cv = window.cv;
+    const gray = new cv.Mat();
+    cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
+
+    // 輝度統計
+    const meanScalar = cv.mean(gray);
+    const meanVal = meanScalar[0];
+
+    // 標準偏差（コントラスト）
+    const meanMat = new cv.Mat();
+    const stdMat = new cv.Mat();
+    cv.meanStdDev(gray, meanMat, stdMat);
+    const stdVal = stdMat.doubleAt(0, 0);
+
+    // ラプラシアン分散（ボケ判定）
+    const lap = new cv.Mat();
+    cv.Laplacian(gray, lap, cv.CV_64F);
+    const lapMean = new cv.Mat();
+    const lapStd = new cv.Mat();
+    cv.meanStdDev(lap, lapMean, lapStd);
+    const lapVar = Math.pow(lapStd.doubleAt(0, 0), 2);
+
+    const warnings = [];
+    if (meanVal < 50)  warnings.push('too_dark');
+    if (meanVal > 220) warnings.push('too_bright');
+    if (stdVal < 30)   warnings.push('low_contrast');
+    if (lapVar < 80)   warnings.push('motion_blur');
+
+    gray.delete(); meanMat.delete(); stdMat.delete();
+    lap.delete(); lapMean.delete(); lapStd.delete();
+
+    return {
+      warnings,
+      metrics: {
+        mean_brightness: meanVal,
+        contrast_std: stdVal,
+        laplacian_variance: lapVar,
+      },
+    };
+  }
+
+  // ============================================================
+  // ホログラム検出
+  //   中央のアートワーク領域で、彩度の周期的変化（虹色パターン）を検出
+  // ============================================================
+  function detectHolographic(rectMat) {
+    const cv = window.cv;
+    const W = rectMat.cols, H = rectMat.rows;
+    // アートワーク領域 (中央 60%)
+    const ax = Math.round(W * 0.15);
+    const ay = Math.round(H * 0.18);
+    const aw = Math.round(W * 0.70);
+    const ah = Math.round(H * 0.37);
+
+    const roi = rectMat.roi(new cv.Rect(ax, ay, aw, ah));
+    const hsv = new cv.Mat();
+    cv.cvtColor(roi, hsv, cv.COLOR_RGBA2RGB);
+    cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+
+    const ch = new cv.MatVector();
+    cv.split(hsv, ch);
+    const Hch = ch.get(0);  // Hue
+    const Sch = ch.get(1);  // Saturation
+
+    // 1) 彩度の標準偏差（ホログラムは彩度バリエーションが大きい）
+    const sMean = new cv.Mat();
+    const sStd = new cv.Mat();
+    cv.meanStdDev(Sch, sMean, sStd);
+    const satStd = sStd.doubleAt(0, 0);
+
+    // 2) Hue のヒストグラム広がり（多色性）
+    let hueRange = 0;
+    try {
+      // ヒストグラム計算
+      const channels = new cv.MatVector();
+      channels.push_back(Hch);
+      const mask = new cv.Mat();
+      const hist = new cv.Mat();
+      // OpenCV.js は cv.calcHist が一部不安定なので簡易的にサンプリング
+      const sample = [];
+      const step = Math.max(1, Math.floor(Hch.rows * Hch.cols / 4000));
+      for (let yy = 0; yy < Hch.rows; yy += 4) {
+        for (let xx = 0; xx < Hch.cols; xx += 4) {
+          const v = Hch.ucharAt(yy, xx);
+          if (Sch.ucharAt(yy, xx) > 30) sample.push(v); // 彩度がある画素のみ
+        }
+      }
+      if (sample.length > 50) {
+        sample.sort((a, b) => a - b);
+        const p10 = sample[Math.floor(sample.length * 0.1)];
+        const p90 = sample[Math.floor(sample.length * 0.9)];
+        hueRange = p90 - p10;
+      }
+      channels.delete(); mask.delete(); hist.delete();
+    } catch (_) { hueRange = 0; }
+
+    // ホログラムスコア: 彩度のバラつきとHueの広がりを組み合わせる
+    const satScore = clamp01((satStd - 25) / 60);  // satStd 25→0, 85→1
+    const hueScore = clamp01((hueRange - 20) / 80); // hueRange 20→0, 100→1
+    const score = (satScore * 0.6 + hueScore * 0.4);
+
+    // 0.45以上ならホログラムカードと推定
+    const is_holographic = score >= 0.45;
+
+    ch.delete(); hsv.delete(); roi.delete();
+    sMean.delete(); sStd.delete();
+
+    return {
+      is_holographic,
+      score,
+      area_norm: [ax / W, ay / H, (ax + aw) / W, (ay + ah) / H],
+      metrics: { saturation_std: satStd, hue_range: hueRange },
+    };
+  }
+
+  // ============================================================
+  // レイアウトマスクで信頼度を減衰
+  // ============================================================
+  function applyLayoutMask(d, holoInfo) {
+    const bbox = bboxNormOf(d);
+    if (!bbox) return;
+    const [nx1, ny1, nx2, ny2] = bbox;
+    const cy = (ny1 + ny2) / 2;
+    const cx = (nx1 + nx2) / 2;
+
+    // テキスト領域（折れ目以外を強く減衰、折れ目は弱く減衰）
+    let inText = false;
+    for (const z of DETECT_PARAMS.textZones) {
+      if (cy >= z.y1 && cy <= z.y2) { inText = true; break; }
+    }
+    if (inText) {
+      // 折れ目は構造的なので減衰を弱く（0.7）
+      const factor = (d.type === 'crease') ? 0.7 : 0.5;
+      d.confidence = (d.confidence || 0) * factor;
+      d._mask_applied = (d._mask_applied || []).concat(['text_zone']);
+    }
+
+    // ホログラム領域: Crease 以外を減衰（折れ目は本物の損傷の可能性）
+    if (holoInfo && holoInfo.is_holographic && holoInfo.area_norm) {
+      const [hx1, hy1, hx2, hy2] = holoInfo.area_norm;
+      if (cx >= hx1 && cx <= hx2 && cy >= hy1 && cy <= hy2) {
+        if (d.type !== 'crease') {
+          d.confidence = (d.confidence || 0) * 0.7;
+          d._mask_applied = (d._mask_applied || []).concat(['holo_zone']);
+        }
+      }
+    }
+  }
+
+  function bboxNormOf(d) {
+    if (!d.geom) return null;
+    if (d.geom.kind === 'bbox' && d.geom.norm) return d.geom.norm;
+    if (d.geom.kind === 'polyline' && d.geom.points_norm) {
+      const xs = d.geom.points_norm.map(p => p[0]);
+      const ys = d.geom.points_norm.map(p => p[1]);
+      return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+    }
+    return null;
+  }
+
+  // ============================================================
+  // NMS（同タイプ内の重複検出を統合）
+  // ============================================================
+  function applyNMS(detections, iouThresh) {
+    // タイプごとにグループ化
+    const byType = {};
+    detections.forEach(d => {
+      const t = d.type;
+      if (!byType[t]) byType[t] = [];
+      byType[t].push(d);
+    });
+
+    const out = [];
+    for (const t of Object.keys(byType)) {
+      const list = byType[t].slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+      const keep = [];
+      for (const d of list) {
+        const dBbox = bboxNormOf(d);
+        if (!dBbox) { keep.push(d); continue; }
+        let suppressed = false;
+        for (const k of keep) {
+          const kBbox = bboxNormOf(k);
+          if (!kBbox) continue;
+          if (computeIoU(dBbox, kBbox) > iouThresh) {
+            suppressed = true;
+            break;
+          }
+        }
+        if (!suppressed) keep.push(d);
+      }
+      out.push(...keep);
+    }
+    return out;
+  }
+
+  function computeIoU(a, b) {
+    const [ax1, ay1, ax2, ay2] = a;
+    const [bx1, by1, bx2, by2] = b;
+    const ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
+    const ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
+    const iw = Math.max(0, ix2 - ix1), ih = Math.max(0, iy2 - iy1);
+    const inter = iw * ih;
+    const ua = Math.max(0, ax2 - ax1) * Math.max(0, ay2 - ay1);
+    const ub = Math.max(0, bx2 - bx1) * Math.max(0, by2 - by1);
+    const uni = ua + ub - inter;
+    return uni > 0 ? inter / uni : 0;
+  }
+
+  // ============================================================
+  // センタリング採点
+  // ============================================================
+
+  /**
+   * 内側枠（アートワーク枠）を検出して 4 辺の枠幅 (px) を返す
+   * 手法: 各辺から内側へスキャンして輝度・色相の変化点を統計的に決定
+   * @returns {{top:number,bottom:number,left:number,right:number, outer:[x,y,x,y], inner:[x,y,x,y], confidence:number} | null}
+   */
+  function detectInnerFrame(rectMat) {
+    const cv = window.cv;
+    const W = rectMat.cols, H = rectMat.rows;
+
+    // RGBA → RGB
+    const rgb = new cv.Mat();
+    cv.cvtColor(rectMat, rgb, cv.COLOR_RGBA2RGB);
+    // グレースケールと HSV 両方利用
+    const gray = new cv.Mat();
+    cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+    const hsv = new cv.Mat();
+    cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+
+    // 各辺を独立に検出。サンプリング数 SAMPLES、最大スキャン深度 MAX_SCAN
+    const SAMPLES = 21;
+    const MAX_SCAN_TB = Math.floor(H * 0.2);  // 上下: カード高さの 20%
+    const MAX_SCAN_LR = Math.floor(W * 0.2);  // 左右: カード幅の 20%
+    const MIN_BORDER_TB = Math.floor(H * 0.005);
+    const MIN_BORDER_LR = Math.floor(W * 0.005);
+
+    // 上辺: 各列で上から下へスキャン、輝度/色相が大きく変わる点を「内枠」とする
+    const topVals = [];
+    for (let i = 1; i < SAMPLES - 1; i++) {
+      const x = Math.round((i / SAMPLES) * W);
+      const v = scanForFrameBoundary(gray, hsv, x, 0, 0, 1, MAX_SCAN_TB, MIN_BORDER_TB);
+      if (v != null) topVals.push(v);
+    }
+    const bottomVals = [];
+    for (let i = 1; i < SAMPLES - 1; i++) {
+      const x = Math.round((i / SAMPLES) * W);
+      const v = scanForFrameBoundary(gray, hsv, x, H - 1, 0, -1, MAX_SCAN_TB, MIN_BORDER_TB);
+      if (v != null) bottomVals.push(v);
+    }
+    const leftVals = [];
+    for (let i = 1; i < SAMPLES - 1; i++) {
+      const y = Math.round((i / SAMPLES) * H);
+      const v = scanForFrameBoundary(gray, hsv, 0, y, 1, 0, MAX_SCAN_LR, MIN_BORDER_LR);
+      if (v != null) leftVals.push(v);
+    }
+    const rightVals = [];
+    for (let i = 1; i < SAMPLES - 1; i++) {
+      const y = Math.round((i / SAMPLES) * H);
+      const v = scanForFrameBoundary(gray, hsv, W - 1, y, -1, 0, MAX_SCAN_LR, MIN_BORDER_LR);
+      if (v != null) rightVals.push(v);
+    }
+
+    rgb.delete(); gray.delete(); hsv.delete();
+
+    // ロバスト推定: 中央値（外れ値耐性）
+    const top    = robustMedian(topVals);
+    const bottom = robustMedian(bottomVals);
+    const left   = robustMedian(leftVals);
+    const right  = robustMedian(rightVals);
+
+    if (top == null || bottom == null || left == null || right == null) return null;
+    if (top + bottom < 4 || left + right < 4) return null; // 検出失敗
+
+    const innerX1 = Math.round(left);
+    const innerY1 = Math.round(top);
+    const innerX2 = Math.round(W - right);
+    const innerY2 = Math.round(H - bottom);
+
+    // 信頼度: サンプルの分散（小さいほど高信頼）
+    const variances = [
+      stdOf(topVals), stdOf(bottomVals), stdOf(leftVals), stdOf(rightVals)
+    ].filter(v => v != null);
+    const avgStd = variances.length ? variances.reduce((a, b) => a + b, 0) / variances.length : 30;
+    const confidence = clamp01(1 - avgStd / 30);
+
+    return {
+      top, bottom, left, right,
+      outer: [0, 0, W, H],
+      inner: [innerX1, innerY1, innerX2, innerY2],
+      confidence,
+    };
+  }
+
+  // 1辺の境界をスキャン: 始点 (sx, sy) から方向 (dx, dy) へ進み、輝度 or 色相が大きく変化する点までの距離を返す
+  function scanForFrameBoundary(grayMat, hsvMat, sx, sy, dx, dy, maxScan, minBorder) {
+    const W = grayMat.cols, H = grayMat.rows;
+    // エッジ部の最初の数 px は不安定なので minBorder スキップ
+    let prevGray = null;
+    let prevHue = null;
+    let edgeAccum = 0;
+    for (let s = 0; s < maxScan; s++) {
+      const x = sx + dx * s;
+      const y = sy + dy * s;
+      if (x < 0 || x >= W || y < 0 || y >= H) break;
+      const g = grayMat.ucharAt(y, x);
+      // HSV: H = 0, S = 1, V = 2 (3チャンネル)
+      const hueIdx = (y * W + x) * 3;
+      const h = hsvMat.data[hueIdx];
+      if (s >= minBorder && prevGray != null) {
+        const dG = Math.abs(g - prevGray);
+        let dH = Math.abs(h - prevHue);
+        // 色相は循環するので min(dH, 180 - dH)
+        dH = Math.min(dH, 180 - dH);
+        // どちらかが閾値超えれば「変化点」候補
+        if (dG > 22 || dH > 12) {
+          edgeAccum++;
+          if (edgeAccum >= 2) return s;  // 2連続で変化があれば確定
+        } else {
+          edgeAccum = 0;
+        }
+      }
+      prevGray = g;
+      prevHue = h;
+    }
+    return null;
+  }
+
+  function robustMedian(values) {
+    if (!values || values.length === 0) return null;
+    const sorted = values.slice().sort((a, b) => a - b);
+    // 上下 10% を除外してから中央値
+    const trim = Math.floor(sorted.length * 0.1);
+    const trimmed = sorted.slice(trim, sorted.length - trim);
+    if (trimmed.length === 0) return sorted[Math.floor(sorted.length / 2)];
+    return trimmed[Math.floor(trimmed.length / 2)];
+  }
+
+  function stdOf(values) {
+    if (!values || values.length < 2) return null;
+    const m = values.reduce((a, b) => a + b, 0) / values.length;
+    const v = values.reduce((a, b) => a + (b - m) * (b - m), 0) / values.length;
+    return Math.sqrt(v);
+  }
+
+  /**
+   * 枠幅からセンタリング比率を計算
+   * @param {{top:number,bottom:number,left:number,right:number, outer, inner, confidence}} frame
+   */
+  function computeCentering(frame) {
+    const { top, bottom, left, right } = frame;
+    const horizSum = left + right;
+    const vertSum = top + bottom;
+    const leftPct = (left / horizSum) * 100;
+    const rightPct = (right / horizSum) * 100;
+    const topPct = (top / vertSum) * 100;
+    const bottomPct = (bottom / vertSum) * 100;
+
+    const horizDev = Math.abs(left - right) / horizSum * 100;
+    const vertDev = Math.abs(top - bottom) / vertSum * 100;
+
+    const horizontal = {
+      leftPx: left,
+      rightPx: right,
+      leftPercent: leftPct,
+      rightPercent: rightPct,
+      deviation: horizDev,
+      label: `${Math.round(leftPct)}/${Math.round(rightPct)}`,
+    };
+    const vertical = {
+      topPx: top,
+      bottomPx: bottom,
+      topPercent: topPct,
+      bottomPercent: bottomPct,
+      deviation: vertDev,
+      label: `${Math.round(topPct)}/${Math.round(bottomPct)}`,
+    };
+
+    // PSAグレード推定（最も悪い軸を採用）
+    const worstDeviation = Math.max(horizDev, vertDev);
+    const worstRatio = 50 + worstDeviation / 2; // dev=10 → 55/45
+
+    let estimatedGrade;
+    if (worstRatio <= 55) estimatedGrade = 'GEM MINT 10';
+    else if (worstRatio <= 60) estimatedGrade = 'MINT 9';
+    else if (worstRatio <= 65) estimatedGrade = 'NM-MT 8';
+    else if (worstRatio <= 70) estimatedGrade = 'NM 7';
+    else if (worstRatio <= 75) estimatedGrade = 'EX-MT 6';
+    else if (worstRatio <= 80) estimatedGrade = 'EX 5';
+    else estimatedGrade = 'VG-EX or below';
+
+    const overallScore = Math.max(0, Math.round(100 - worstDeviation * 2));
+
+    return {
+      horizontal,
+      vertical,
+      estimatedGrade,
+      overallScore,
+      worstDeviation,
+      annotation: {
+        outer_rect: frame.outer,
+        inner_rect: frame.inner,
+      },
+      detection_confidence: frame.confidence,
+    };
+  }
+
+  /**
+   * Canvas にセンタリングオーバーレイを描画
+   * @param {HTMLCanvasElement} canvas - canvasOverlay
+   * @param {object} centering - JSON.card.centering
+   * @param {number} sx - rect→canvas スケール
+   * @param {number} sy
+   */
+  function drawCenteringOverlay(canvas, centering, sx, sy) {
+    if (!canvas || !centering || !centering.available) return;
+    const ctx = canvas.getContext('2d');
+    const ann = centering.annotation;
+    if (!ann || !ann.outer_rect || !ann.inner_rect) return;
+
+    const [ox1, oy1, ox2, oy2] = ann.outer_rect;
+    const [ix1, iy1, ix2, iy2] = ann.inner_rect;
+    const Ox1 = ox1 * sx, Oy1 = oy1 * sy, Ox2 = ox2 * sx, Oy2 = oy2 * sy;
+    const Ix1 = ix1 * sx, Iy1 = iy1 * sy, Ix2 = ix2 * sx, Iy2 = iy2 * sy;
+
+    ctx.save();
+    // 外枠（緑）
+    ctx.strokeStyle = '#22c55e';
+    ctx.lineWidth = Math.max(2, canvas.width / 400);
+    ctx.setLineDash([]);
+    ctx.strokeRect(Ox1, Oy1, Ox2 - Ox1, Oy2 - Oy1);
+
+    // 内枠（青）
+    ctx.strokeStyle = '#3b82f6';
+    ctx.setLineDash([8, 4]);
+    ctx.strokeRect(Ix1, Iy1, Ix2 - Ix1, Iy2 - Iy1);
+    ctx.setLineDash([]);
+
+    // 4辺の矢印（枠幅を可視化）
+    ctx.strokeStyle = '#fbbf24';
+    ctx.fillStyle = '#fbbf24';
+    ctx.lineWidth = Math.max(1.5, canvas.width / 600);
+    const cxV = (Ox1 + Ox2) / 2;
+    const cyH = (Oy1 + Oy2) / 2;
+    drawArrow(ctx, cxV, Oy1, cxV, Iy1);   // 上辺
+    drawArrow(ctx, cxV, Oy2, cxV, Iy2);   // 下辺
+    drawArrow(ctx, Ox1, cyH, Ix1, cyH);   // 左辺
+    drawArrow(ctx, Ox2, cyH, Ix2, cyH);   // 右辺
+
+    // テキスト: 比率ラベル
+    const fontSize = Math.max(14, canvas.width / 60);
+    ctx.font = `bold ${fontSize}px ${getComputedStyle(document.body).fontFamily || 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const label = `${centering.horizontal.ratio_label} ・ ${centering.vertical.ratio_label}`;
+    const tx = (Ix1 + Ix2) / 2;
+    const ty = (Iy1 + Iy2) / 2;
+    // 背景
+    const metrics = ctx.measureText(label);
+    const padX = 10, padY = 6;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(tx - metrics.width / 2 - padX, ty - fontSize / 2 - padY, metrics.width + padX * 2, fontSize + padY * 2);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText(label, tx, ty);
+
+    ctx.restore();
+  }
+
+  function drawArrow(ctx, x1, y1, x2, y2) {
+    const headLen = 6;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 4) return;
+    const ux = dx / len, uy = dy / len;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.stroke();
+    // 矢頭
+    const ang = Math.atan2(dy, dx);
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - headLen * Math.cos(ang - Math.PI / 6), y2 - headLen * Math.sin(ang - Math.PI / 6));
+    ctx.lineTo(x2 - headLen * Math.cos(ang + Math.PI / 6), y2 - headLen * Math.sin(ang + Math.PI / 6));
+    ctx.closePath();
+    ctx.fill();
+    // 反対側にも矢頭（双方向矢印）
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 + headLen * Math.cos(ang - Math.PI / 6), y1 + headLen * Math.sin(ang - Math.PI / 6));
+    ctx.lineTo(x1 + headLen * Math.cos(ang + Math.PI / 6), y1 + headLen * Math.sin(ang + Math.PI / 6));
+    ctx.closePath();
+    ctx.fill();
   }
 
   // ============================================================

@@ -117,7 +117,47 @@
         <span class="results-meta-pill"><span id="meta-count">0</span> 件の損傷</span>
         <span class="results-meta-pill">信頼度 <span id="meta-confidence">—</span></span>
         <span class="results-meta-pill">エンジン <span id="meta-engine">heuristic-cv</span></span>
+        <span class="results-meta-pill" id="meta-holo-pill" hidden>✨ ホログラム</span>
       </div>
+
+      <div id="quality-warnings" class="quality-warnings" hidden role="note" aria-label="撮影品質に関する警告">
+        <strong>📸 撮影品質に注意:</strong>
+        <ul id="quality-warnings-list"></ul>
+      </div>
+
+      <section id="centering-section" class="centering-section" hidden aria-label="センタリング採点">
+        <header class="centering-header">
+          <h3>📐 センタリング採点</h3>
+          <label class="centering-toggle">
+            <input type="checkbox" id="centering-overlay-toggle" checked>
+            <span>枠線オーバーレイを表示</span>
+          </label>
+        </header>
+        <div class="centering-body">
+          <div class="centering-ratios">
+            <div class="centering-ratio">
+              <span class="centering-ratio-label">左右</span>
+              <span class="centering-ratio-value" id="centering-h-label">—</span>
+              <div class="centering-ratio-bar"><span id="centering-h-bar-fill"></span></div>
+              <small class="centering-ratio-detail" id="centering-h-detail"></small>
+            </div>
+            <div class="centering-ratio">
+              <span class="centering-ratio-label">上下</span>
+              <span class="centering-ratio-value" id="centering-v-label">—</span>
+              <div class="centering-ratio-bar"><span id="centering-v-bar-fill"></span></div>
+              <small class="centering-ratio-detail" id="centering-v-detail"></small>
+            </div>
+          </div>
+          <div class="centering-grade">
+            <div class="grade-badge" id="centering-grade-badge">—</div>
+            <div class="centering-score">
+              <span class="centering-score-value" id="centering-score-value">—</span>
+              <span class="centering-score-suffix">/ 100</span>
+            </div>
+          </div>
+        </div>
+        <p class="centering-note" id="centering-note"></p>
+      </section>
 
       <div class="results-grid">
         <div class="result-image">

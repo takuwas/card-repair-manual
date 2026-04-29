@@ -817,3 +817,221 @@
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
+
+/* ============================================================
+ * 撮影品質警告
+ * ============================================================ */
+.quality-warnings {
+  background: rgba(154, 103, 0, 0.08);
+  border: 1px solid var(--color-warning);
+  border-left-width: 4px;
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--color-text);
+}
+[data-theme="dark"] .quality-warnings {
+  background: rgba(255, 200, 80, 0.10);
+  color: #ffe8a3;
+}
+.quality-warnings strong {
+  display: block;
+  font-size: 13px;
+  color: var(--color-warning);
+  margin-bottom: 4px;
+}
+.quality-warnings ul {
+  margin: 0;
+  padding-left: 22px;
+  line-height: 1.6;
+}
+
+/* ============================================================
+ * センタリング採点セクション
+ * ============================================================ */
+.centering-section {
+  background: var(--color-bg-elev);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  margin-bottom: 20px;
+  position: relative;
+  overflow: hidden;
+}
+.centering-section::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.04), rgba(34, 197, 94, 0.04));
+  pointer-events: none;
+}
+.centering-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  position: relative;
+  z-index: 1;
+}
+.centering-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  border: none !important;
+  padding: 0 !important;
+}
+.centering-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.centering-toggle input { cursor: pointer; }
+.centering-body {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 20px;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+}
+@media (max-width: 600px) {
+  .centering-body { grid-template-columns: 1fr; gap: 12px; }
+}
+.centering-ratios {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.centering-ratio {
+  display: grid;
+  grid-template-columns: 40px 80px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.centering-ratio-label {
+  font-weight: 700;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+.centering-ratio-value {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+.centering-ratio-bar {
+  position: relative;
+  height: 12px;
+  background: var(--color-border-soft);
+  border-radius: 6px;
+  overflow: hidden;
+  display: block;
+}
+.centering-ratio-bar > span {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  border-radius: 6px;
+  transition: left .4s ease, width .4s ease;
+}
+.centering-ratio-bar > span.dev-mid    { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+.centering-ratio-bar > span.dev-bad    { background: linear-gradient(90deg, #ef4444, #f87171); }
+.centering-ratio-bar::after {
+  /* 50%の中央線 */
+  content: '';
+  position: absolute;
+  top: -2px; bottom: -2px; left: 50%;
+  width: 1px;
+  background: rgba(0, 0, 0, 0.35);
+}
+[data-theme="dark"] .centering-ratio-bar::after { background: rgba(255, 255, 255, 0.4); }
+.centering-ratio-detail {
+  grid-column: 2 / -1;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+}
+.centering-grade {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-left: 1px solid var(--color-border-soft);
+  min-width: 130px;
+}
+@media (max-width: 600px) {
+  .centering-grade { border-left: none; border-top: 1px solid var(--color-border-soft); padding-top: 12px; }
+}
+.grade-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  background: linear-gradient(135deg, #22c55e, #16a34a);
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(34, 197, 94, 0.3);
+  white-space: nowrap;
+}
+.grade-badge.grade-9     { background: linear-gradient(135deg, #3b82f6, #2563eb); box-shadow: 0 2px 6px rgba(59, 130, 246, 0.3); }
+.grade-badge.grade-8     { background: linear-gradient(135deg, #06b6d4, #0891b2); box-shadow: 0 2px 6px rgba(6, 182, 212, 0.3); }
+.grade-badge.grade-7     { background: linear-gradient(135deg, #f59e0b, #d97706); box-shadow: 0 2px 6px rgba(245, 158, 11, 0.3); }
+.grade-badge.grade-6     { background: linear-gradient(135deg, #f97316, #ea580c); box-shadow: 0 2px 6px rgba(249, 115, 22, 0.3); }
+.grade-badge.grade-5     { background: linear-gradient(135deg, #ef4444, #dc2626); box-shadow: 0 2px 6px rgba(239, 68, 68, 0.3); }
+.grade-badge.grade-low   { background: linear-gradient(135deg, #6b7280, #4b5563); box-shadow: 0 2px 6px rgba(107, 114, 128, 0.3); }
+.centering-score {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-family: var(--font-mono);
+}
+.centering-score-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+.centering-score-suffix {
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+.centering-note {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-muted);
+  position: relative;
+  z-index: 1;
+}
+
+/* ホログラム表示 pill */
+#meta-holo-pill {
+  background: linear-gradient(90deg, #ec4899, #8b5cf6, #3b82f6, #06b6d4);
+  background-size: 200% 100%;
+  color: #fff !important;
+  border-color: transparent;
+  animation: holoshimmer 3s linear infinite;
+}
+#meta-holo-pill span { color: #fff !important; }
+@keyframes holoshimmer {
+  0%   { background-position: 0% 0%; }
+  100% { background-position: 200% 0%; }
+}
+
+/* 矢印アニメーション（オーバーレイのpulse） */
+@keyframes centeringPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
+}
