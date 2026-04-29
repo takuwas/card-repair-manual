@@ -981,6 +981,17 @@ input[type="range"] {
   }
 }
 
+/* 900px 以下では .sidebar-toggle が表示されるが、annotate ページでは
+   サイドバーを隠す/出すトグルとして機能させる */
+@media (max-width: 900px) {
+  .annot-sidebar {
+    display: none;
+  }
+  .annot-sidebar.open {
+    display: flex;
+  }
+}
+
 @media (max-width: 700px) {
   .annot-main {
     padding: 12px 12px 48px;

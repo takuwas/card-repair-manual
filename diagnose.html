@@ -14,8 +14,10 @@
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="diagnose.css">
 
-  <!-- OpenCV.js を preload で早期ダウンロード開始（ページレンダリングと並行、メインスレッドはブロックしない） -->
-  <link rel="preload" as="script" crossorigin href="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js">
+  <!-- OpenCV.js を preload で早期ダウンロード開始（ページレンダリングと並行、メインスレッドはブロックしない）
+       crossorigin="anonymous" は diagnose.js 側 loadScript() が script.crossOrigin='anonymous' を付けるのと一致させること。
+       一致しないと preload が破棄され二重ダウンロードになる。 -->
+  <link rel="preload" as="script" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js">
 
   <!-- DOMPurify（既存サイトと同じくサニタイズ用） -->
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>

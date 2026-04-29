@@ -224,10 +224,15 @@
     'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js'
   ];
 
+  // ★注意★ この loadScript は OpenCV.js 専用（タイムアウト付き）。
+  // 関数名の衝突を避けるため、PNG保存などの汎用ロード用は loadExternalScript() に分離している。
   function loadScript(url, timeoutMs = 30000) {
     return new Promise((resolve, reject) => {
       const script = document.createElement('script');
       script.async = true;
+      // preload (HTML 側) が crossorigin 付きで同URLを先読みしているため、
+      // 一致させて preload を有効化する。CDN は CORS 対応している前提。
+      script.crossOrigin = 'anonymous';
       script.src = url;
       let done = false;
       const timer = setTimeout(() => {
@@ -294,17 +299,23 @@
         const host = new URL(url).hostname;
         setCvStatus('loading', `⏳ 検出エンジン (OpenCV.js) を読み込み中… (${host})`);
         try {
-          await loadScript(url, 30000);
-          await waitForOpenCVRuntime(30000);
+          // CDNごとにスクリプトロード15秒・ランタイム初期化15秒の制限
+          // 旧コードは 30s + 30s = 最大60s/CDN。全CDN試すと最大4分間ハングしうるため短縮。
+          await loadScript(url, 15000);
+          await waitForOpenCVRuntime(15000);
+          if (!(window.cv && typeof window.cv.Mat === 'function')) {
+            throw new Error('cv.Mat unavailable after load');
+          }
           cvReady = true;
           setCvStatus('ready', `✅ 検出エンジン (OpenCV.js) の準備完了 (${host})`);
           return window.cv;
         } catch (err) {
           lastErr = err;
           console.warn(`[diagnose] OpenCV CDN failed: ${host} (${err.message})`);
-          // 次のCDNを試す前に window.cv をリセット
+          // 次のCDNを試す前に window.cv をリセット（部分初期化状態を防ぐ）
           if (window.cv && typeof window.cv.Mat !== 'function') {
-            try { delete window.cv; } catch (_) { window.cv = undefined; }
+            try { delete window.cv; } catch (_) {}
+            try { window.cv = undefined; } catch (_) {}
           }
         }
       }
@@ -313,6 +324,12 @@
       setCvStatus('failed', msg);
       throw lastErr || new Error('all CDNs failed');
     })();
+    // 失敗時は次回の waitForOpenCV() でリトライできるよう、Promise を捕捉してから再投げ
+    cvReadyPromise.catch(() => {
+      // ※ 最後に失敗した Promise をキャッシュし続けると永久に「失敗扱い」になるが、
+      //    リトライしても CDN 全滅状態であれば結果は変わらないので、ここでは再試行しない。
+      //    ユーザーは「ページを再読み込み」が一番確実。
+    });
     return cvReadyPromise;
   }
   // OpenCV.js はサイズが大きく（〜10MB）WASM 初期化でメインスレッドが一瞬重くなる。
@@ -370,8 +387,17 @@
   if (btnCamera) btnCamera.addEventListener('click', (e) => { e.stopPropagation(); cameraInput.click(); });
   if (btnSample) btnSample.addEventListener('click', (e) => { e.stopPropagation(); pickSample(); });
 
-  if (fileInput)   fileInput.addEventListener('change', (e) => { if (e.target.files[0]) handleFile(e.target.files[0]); });
-  if (cameraInput) cameraInput.addEventListener('change', (e) => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+  // ファイル input の value をクリアしておくことで、同じファイルを再選択した場合にも change が発火する
+  if (fileInput)   fileInput.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (f) handleFile(f);
+  });
+  if (cameraInput) cameraInput.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (f) handleFile(f);
+  });
 
   if (btnRedo) btnRedo.addEventListener('click', () => { hideResults(); fileInput.click(); });
   if (btnExport) btnExport.addEventListener('click', exportPNG);
@@ -473,96 +499,144 @@
   // ============================================================
   // メイン: ファイル処理
   // ============================================================
+  // 多重実行ガード（同じユーザー操作で複数ファイルが投げ込まれた場合の保険）
+  let isHandlingFile = false;
+
   async function handleFile(file) {
     if (file && typeof file.then === 'function') {
       file = await file;
       if (!file) return;
     }
-    hideError();
-
-    // ここからはユーザーが「待機中」になる → ステータスバナーを表示してOK
-    userIsWaiting = true;
-    // 既にロード済みなら再度バナーを出す必要はない
-    if (cvLoadFailed) {
-      setCvStatus('failed', '⚠️ OpenCV.js の読み込みに失敗しました（全CDN応答なし）');
-    } else if (!cvReady) {
-      setCvStatus('loading', '⏳ 検出エンジン (OpenCV.js) を読み込み中…');
+    if (!file) return;
+    if (isHandlingFile) {
+      console.warn('[diagnose] handleFile called while already running. Ignoring duplicate.');
+      return;
     }
+    isHandlingFile = true;
 
-    // バリデーション
-    if (!ALLOWED_MIME.includes(file.type)) {
-      userIsWaiting = false;
-      if (cvStatus) cvStatus.hidden = true;
-      return showError({
-        code: 'invalid_format',
-        message: 'JPEG / PNG / WebP のみ対応しています。',
-        hint: `受信した形式: ${file.type || '不明'}`,
+    // 全体ウォッチドッグ: 想定外のハングで「解析中…」が出っ放しになるのを防ぐ。
+    // OpenCV ロード(最大4CDN×30s前後) + 解析(数秒) を見込んで余裕を持たせる。
+    const WATCHDOG_MS = 150000; // 150秒 (= 2.5分)
+    let watchdogFired = false;
+    const watchdogTimer = setTimeout(() => {
+      watchdogFired = true;
+      console.error('[diagnose] watchdog fired: handleFile took too long');
+      // ハング中の await は永久に解決しない可能性があるため、ここで明示的にガードを解除し
+      // ユーザーが再試行できるようにする（finally だけに頼らない）
+      isHandlingFile = false;
+      showError({
+        code: 'internal_error',
+        message: '処理がタイムアウトしました',
+        hint: 'ネットワークが不安定か、検出エンジンの読み込みに時間がかかっています。ページを再読み込みしてお試しください。',
       });
-    }
-    if (file.size > MAX_FILE_SIZE) {
-      userIsWaiting = false;
-      if (cvStatus) cvStatus.hidden = true;
-      return showError({
-        code: 'file_too_large',
-        message: `画像サイズが ${(MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB を超えています。`,
-        hint: `現在のサイズ: ${(file.size / 1024 / 1024).toFixed(1)}MB`,
-      });
-    }
+    }, WATCHDOG_MS);
 
-    // 画像読み込み
-    showProgress(5, '画像を読み込み中', 1);
+    const finish = () => {
+      clearTimeout(watchdogTimer);
+      isHandlingFile = false;
+    };
+
     try {
-      currentImage = await loadImage(file);
-    } catch (err) {
-      userIsWaiting = false;
-      if (cvStatus) cvStatus.hidden = true;
-      return showError({ code: 'load_failed', message: '画像の読み込みに失敗しました', hint: err.message });
-    }
+      hideError();
 
-    // OpenCV.js のロードを待機
-    showProgress(15, '検出エンジン (OpenCV.js) の準備中', 2);
-    try {
-      await waitForOpenCV();
-    } catch (err) {
-      return showError({
-        code: 'model_load_failed',
-        message: '検出エンジン (OpenCV.js) の読み込みに失敗しました',
-        hint: 'ページを再読み込みするか、ネットワーク接続をご確認ください。',
-      });
-    }
+      // ここからはユーザーが「待機中」になる → ステータスバナーを表示してOK
+      userIsWaiting = true;
+      // 既にロード済みなら再度バナーを出す必要はない
+      if (cvLoadFailed) {
+        setCvStatus('failed', '⚠️ OpenCV.js の読み込みに失敗しました（全CDN応答なし）');
+      } else if (!cvReady) {
+        setCvStatus('loading', '⏳ 検出エンジン (OpenCV.js) を読み込み中…');
+      }
 
-    // 解析実行
-    showProgress(35, 'カードを検出・正面化中', 2);
-    let result;
-    try {
-      result = await analyzeCardFromImage(currentImage, file);
-    } catch (err) {
-      console.error('[diagnose] analyze failed:', err);
-      return showError({ code: 'internal_error', message: err.message || '解析中にエラーが発生しました', hint: 'お手数ですが別の画像で再度お試しください。' });
-    }
+      // バリデーション
+      if (!ALLOWED_MIME.includes(file.type)) {
+        userIsWaiting = false;
+        if (cvStatus) cvStatus.hidden = true;
+        showError({
+          code: 'invalid_format',
+          message: 'JPEG / PNG / WebP のみ対応しています。',
+          hint: `受信した形式: ${file.type || '不明'}`,
+        });
+        return;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        userIsWaiting = false;
+        if (cvStatus) cvStatus.hidden = true;
+        showError({
+          code: 'file_too_large',
+          message: `画像サイズが ${(MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB を超えています。`,
+          hint: `現在のサイズ: ${(file.size / 1024 / 1024).toFixed(1)}MB`,
+        });
+        return;
+      }
 
-    if (result.error === 'card_not_detected') {
-      return showError({
-        code: 'card_not_found',
-        message: 'カードが認識できません',
-        hint: '明るい背景・カード全体が枠内に収まるよう正面から撮影し、再度お試しください。',
-        hints: [
-          'カードの四隅が枠内にすべて収まっていますか？',
-          '真上から撮影していますか？（斜め撮影は失敗の原因）',
-          '背景とカードのコントラスト（黒い背景がおすすめ）',
-          'ピントは合っていますか？',
-        ],
-      });
-    }
+      // 画像読み込み
+      showProgress(5, '画像を読み込み中', 1);
+      try {
+        currentImage = await loadImage(file);
+      } catch (err) {
+        if (watchdogFired) return;
+        userIsWaiting = false;
+        if (cvStatus) cvStatus.hidden = true;
+        showError({ code: 'load_failed', message: '画像の読み込みに失敗しました', hint: err.message });
+        return;
+      }
+      if (watchdogFired) return;
 
-    currentResult = result;
-    showProgress(85, '結果を描画中', 4);
-    renderResults(result);
-    hideProgress();
-    showResults();
-    setTimeout(() => {
-      resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }, 50);
+      // OpenCV.js のロードを待機
+      showProgress(15, '検出エンジン (OpenCV.js) の準備中', 2);
+      try {
+        await waitForOpenCV();
+      } catch (err) {
+        if (watchdogFired) return;
+        showError({
+          code: 'model_load_failed',
+          message: '検出エンジン (OpenCV.js) の読み込みに失敗しました',
+          hint: 'ページを再読み込みするか、ネットワーク接続をご確認ください。',
+        });
+        return;
+      }
+      if (watchdogFired) return;
+
+      // 解析実行
+      showProgress(35, 'カードを検出・正面化中', 2);
+      let result;
+      try {
+        result = await analyzeCardFromImage(currentImage, file);
+      } catch (err) {
+        if (watchdogFired) return;
+        console.error('[diagnose] analyze failed:', err);
+        showError({ code: 'internal_error', message: err.message || '解析中にエラーが発生しました', hint: 'お手数ですが別の画像で再度お試しください。' });
+        return;
+      }
+      if (watchdogFired) return;
+
+      if (result.error === 'card_not_detected') {
+        showError({
+          code: 'card_not_found',
+          message: 'カードが認識できません',
+          hint: '明るい背景・カード全体が枠内に収まるよう正面から撮影し、再度お試しください。',
+          hints: [
+            'カードの四隅が枠内にすべて収まっていますか？',
+            '真上から撮影していますか？（斜め撮影は失敗の原因）',
+            '背景とカードのコントラスト（黒い背景がおすすめ）',
+            'ピントは合っていますか？',
+          ],
+        });
+        return;
+      }
+
+      currentResult = result;
+      showProgress(85, '結果を描画中', 4);
+      renderResults(result);
+      hideProgress();
+      showResults();
+      setTimeout(() => {
+        if (resultsPanel) resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 50);
+    } finally {
+      finish();
+    }
   }
 
   function loadImage(file) {
@@ -1901,7 +1975,7 @@
   async function exportPNG() {
     try {
       if (!window.html2canvas) {
-        await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
+        await loadExternalScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
       }
       const canvas = await window.html2canvas(resultsPanel, {
         backgroundColor: getComputedStyle(document.body).backgroundColor || '#fff',
@@ -1919,7 +1993,10 @@
     }
   }
 
-  function loadScript(src) {
+  // 汎用スクリプト遅延ロード（html2canvas など、タイムアウト不要・CORS不要なもの専用）。
+  // ★注意★ これを loadScript と同名にすると上の OpenCV 用 loadScript を上書きしてしまい
+  //   タイムアウト機構が無効化されて「永遠に読み込み中」のバグになる。必ず別名にすること。
+  function loadExternalScript(src) {
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
       s.src = src;

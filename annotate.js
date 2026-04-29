@@ -96,6 +96,16 @@
     return DOMPurify.sanitize(String(v ?? ''));
   }
 
+  // HTML テキスト・属性値用のエスケープ (DOMPurify を介さない単純なエスケープ)
+  function escapeHtml(v) {
+    return String(v ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   // ============================================================
   // トースト通知
   // ============================================================
@@ -201,16 +211,22 @@
       },
       async deleteImage(id) {
         const t = await tx(['images', 'annotations'], 'readwrite');
-        await _wrap(t.objectStore('images').delete(id));
-        // 紐づく annotations も削除
-        const idx = t.objectStore('annotations').index('imageId');
-        const cur = idx.openCursor(IDBKeyRange.only(id));
+        // 同じトランザクション内で同期的に複数リクエストを発行する
+        // (await を挟むとトランザクションがクローズされる可能性があるため)
+        const imgStore = t.objectStore('images');
+        const annStore = t.objectStore('annotations');
+        const idx = annStore.index('imageId');
+        imgStore.delete(id);
         return new Promise((resolve, reject) => {
+          const cur = idx.openCursor(IDBKeyRange.only(id));
           cur.onsuccess = (e) => {
             const c = e.target.result;
-            if (c) { c.delete(); c.continue(); } else resolve();
+            if (c) { c.delete(); c.continue(); }
           };
           cur.onerror = (e) => reject(e.target.error);
+          t.oncomplete = () => resolve();
+          t.onerror = (e) => reject(e.target.error);
+          t.onabort = (e) => reject(e.target.error);
         });
       },
       async putAnnotation(annot) {
@@ -236,8 +252,14 @@
       },
       async clearAll() {
         const t = await tx(['images', 'annotations'], 'readwrite');
-        await _wrap(t.objectStore('images').clear());
-        await _wrap(t.objectStore('annotations').clear());
+        // 同じトランザクション内で同期的にリクエスト発行
+        t.objectStore('images').clear();
+        t.objectStore('annotations').clear();
+        return new Promise((resolve, reject) => {
+          t.oncomplete = () => resolve();
+          t.onerror = (e) => reject(e.target.error);
+          t.onabort = (e) => reject(e.target.error);
+        });
       },
     };
   })();
@@ -525,12 +547,14 @@
       i.onload = () => res(i); i.onerror = rej; i.src = rec.dataUrl;
     });
     state.zoom = 1;
+    // updateEmptyState() を先に呼んで canvas-section を表示状態にする
+    // (fitZoomToView は stage.clientWidth を読むため、表示前に呼ぶと 0 になる)
+    updateEmptyState();
     fitZoomToView();
     renderCanvas();
     renderImageList();
     renderAnnotationList();
     updateCanvasMeta();
-    updateEmptyState();
   }
 
   // ============================================================
@@ -578,10 +602,13 @@
       const li = document.createElement('li');
       li.className = 'image-item' + (state.currentImageId === img.id ? ' active' : '');
       li.dataset.imageId = img.id;
+      // 画像要素を構築 (innerHTML で data URL を埋めると DOMPurify 等で壊れる場合があるため、
+      //  src は DOM プロパティ経由で設定する)
+      const safeName = escapeHtml(img.filename);
       li.innerHTML = `
-        <img class="image-thumb" alt="" src="${safeText(img.thumbnailDataUrl)}">
+        <img class="image-thumb" alt="">
         <div class="image-info">
-          <span class="image-name" title="${safeText(img.filename)}">${safeText(img.filename)}</span>
+          <span class="image-name" title="${safeName}">${safeName}</span>
           <span class="image-meta">
             <span>${img.width}×${img.height}</span>
             <span class="annot-badge ${annotCount === 0 ? 'zero' : ''}">${annotCount}</span>
@@ -589,6 +616,8 @@
         </div>
         <button type="button" class="image-delete" aria-label="削除" title="削除">×</button>
       `;
+      const thumbEl = li.querySelector('.image-thumb');
+      if (thumbEl && img.thumbnailDataUrl) thumbEl.src = img.thumbnailDataUrl;
       li.addEventListener('click', (e) => {
         if (e.target.classList.contains('image-delete')) {
           e.stopPropagation();
@@ -665,10 +694,19 @@
     const stage = $('#canvas-stage');
     if (!stage) return;
     const stageW = stage.clientWidth - 16;
-    const scale = stageW / state.currentImage.width;
-    state.zoom = clamp(scale, 0.1, 3);
-    $('#zoom-slider').value = state.zoom;
-    $('#zoom-val').textContent = `${Math.round(state.zoom * 100)}%`;
+    if (stageW <= 0) {
+      // 表示領域がまだ確定していない (canvas-section が hidden 等)
+      // → デフォルトの zoom=1 を維持してフォールバック
+      state.zoom = 1;
+    } else {
+      const scale = stageW / state.currentImage.width;
+      // zoom-slider の min/max (0.1..3) と同期させる
+      state.zoom = clamp(scale, 0.1, 3);
+    }
+    const slider = $('#zoom-slider');
+    if (slider) slider.value = state.zoom;
+    const zVal = $('#zoom-val');
+    if (zVal) zVal.textContent = `${Math.round(state.zoom * 100)}%`;
   }
 
   function renderCanvas() {
@@ -957,6 +995,8 @@
     state.drawing.lastBrushPoint = null;
   }
 
+  // ダブルクリック判定のため、polygon の click を少し遅延させる
+  let _polygonClickTimer = null;
   function onPointerClick(ev) {
     if (!state.currentImage) return;
     const p = eventToImageCoord(ev);
@@ -965,14 +1005,24 @@
       return;
     }
     if (state.tool === 'polygon') {
-      // 頂点追加
-      state.drawing.polygonPoints.push([p.x, p.y]);
-      drawPolygonPreview();
+      // dblclick との競合を避けるため遅延実行
+      // (dblclick が発火したらこのタイマはキャンセルされる)
+      if (_polygonClickTimer) clearTimeout(_polygonClickTimer);
+      _polygonClickTimer = setTimeout(() => {
+        _polygonClickTimer = null;
+        state.drawing.polygonPoints.push([p.x, p.y]);
+        drawPolygonPreview();
+      }, 220);
     }
   }
 
   function onPointerDblClick(ev) {
     if (state.tool === 'polygon') {
+      // 直前の click による頂点追加をキャンセル
+      if (_polygonClickTimer) {
+        clearTimeout(_polygonClickTimer);
+        _polygonClickTimer = null;
+      }
       finishPolygon();
     }
   }
@@ -2140,6 +2190,17 @@ names: [${names}]
           editingAnnotationId = null;
         }
       });
+    });
+    // Esc キーで label-modal を閉じる (confirm-modal は confirmDialog 側で処理)
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const labelModal = $('#label-modal');
+      if (labelModal && !labelModal.hidden) {
+        labelModal.hidden = true;
+        state.pendingAnnotation = null;
+        editingAnnotationId = null;
+        e.stopPropagation();
+      }
     });
   }
 
