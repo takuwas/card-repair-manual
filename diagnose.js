@@ -315,9 +315,25 @@
     })();
     return cvReadyPromise;
   }
-  // 注意: OpenCV.js は重いWASM（10-15MB）でロード時にメインスレッドを長時間ブロックする可能性がある。
-  // そのため、自動ロードせず、ユーザーがアップロード/サンプル選択した時のみ起動する。
-  // → handleFile() 内で waitForOpenCV() が呼ばれた時に初めてロードを開始する
+  // OpenCV.js はサイズが大きく（〜10MB）WASM 初期化でメインスレッドが一瞬重くなる。
+  // ・preload (HTMLヘッダ) でダウンロードはページレンダリングと並行で進む
+  // ・実行（コンパイル＋初期化）は load イベント後の idle 時間に開始 → 初期表示はブロックしない
+  // ・ユーザーがそれより早くアップロードした場合は handleFile() 内で同じ Promise を待機する
+  function startOpenCVPrewarm() {
+    const start = () => {
+      waitForOpenCV().catch(err => console.warn('[diagnose] OpenCV prewarm:', err.message));
+    };
+    if ('requestIdleCallback' in window) {
+      window.requestIdleCallback(start, { timeout: 2000 });
+    } else {
+      setTimeout(start, 500);
+    }
+  }
+  if (document.readyState === 'complete') {
+    startOpenCVPrewarm();
+  } else {
+    window.addEventListener('load', startOpenCVPrewarm, { once: true });
+  }
 
   // ============================================================
   // アップロード関連
