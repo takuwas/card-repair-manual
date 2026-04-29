@@ -78,6 +78,22 @@
   const MAX_FILE_SIZE = 10 * 1024 * 1024;
   const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
   const RECT_W = 750, RECT_H = 1050; // 正面化後のサイズ（damage-detection-algorithms.md §1.2）
+  const PX_TO_MM_DEFAULT = 63.0 / RECT_W;
+
+  // ============================================================
+  // 検出パラメータ（精度向上用の閾値）
+  // ============================================================
+  const DETECT_PARAMS = {
+    // テキスト密度の高い領域（信頼度を減衰させる）
+    textZones: [
+      { name: 'top_text',    y1: 0.00, y2: 0.18 },  // ポケモン名・HP
+      { name: 'bottom_text', y1: 0.62, y2: 0.95 },  // わざ・効果テキスト
+      { name: 'footer',      y1: 0.93, y2: 1.00 },  // 弱点・コレクター情報
+    ],
+    artworkZone: { y1: 0.18, y2: 0.55 },  // アートワーク中央
+    confidenceFloor: 0.18,  // これ未満は棄却
+    nmsIoU: 0.5,
+  };
 
   // ============================================================
   // DOM
@@ -167,6 +183,11 @@
   // ============================================================
   // OpenCV.js のロード監視
   // ============================================================
+  // CVステータスの表示制御:
+  // - userIsWaiting=false (ページロード直後): UIには出さない（バックグラウンドで静かに進行）
+  // - userIsWaiting=true (ユーザーがアップロード→解析待ち中): UIに出す
+  // - 失敗時は常に出す（ユーザーが再操作する判断材料になるため）
+  let userIsWaiting = false;
   function setCvStatus(status, text) {
     if (!cvStatus) return;
     cvStatus.dataset.status = status;
@@ -176,9 +197,21 @@
     if (i) {
       i.textContent = status === 'ready' ? '✅' : status === 'failed' ? '⚠️' : '⏳';
     }
+    if (status === 'failed') {
+      // 失敗は常に表示（ユーザーが対処方法を知る必要があるため）
+      cvStatus.hidden = false;
+      return;
+    }
+    if (!userIsWaiting) {
+      // ユーザーがまだ何もしていない → バナーは出さない
+      cvStatus.hidden = true;
+      return;
+    }
+    // userIsWaiting=true の時のみ表示
+    cvStatus.hidden = false;
     if (status === 'ready') {
       // 数秒後に隠す
-      setTimeout(() => { if (cvStatus) cvStatus.hidden = true; }, 3000);
+      setTimeout(() => { if (cvStatus) cvStatus.hidden = true; }, 2500);
     }
   }
 
@@ -429,8 +462,19 @@
     }
     hideError();
 
+    // ここからはユーザーが「待機中」になる → ステータスバナーを表示してOK
+    userIsWaiting = true;
+    // 既にロード済みなら再度バナーを出す必要はない
+    if (cvLoadFailed) {
+      setCvStatus('failed', '⚠️ OpenCV.js の読み込みに失敗しました（全CDN応答なし）');
+    } else if (!cvReady) {
+      setCvStatus('loading', '⏳ 検出エンジン (OpenCV.js) を読み込み中…');
+    }
+
     // バリデーション
     if (!ALLOWED_MIME.includes(file.type)) {
+      userIsWaiting = false;
+      if (cvStatus) cvStatus.hidden = true;
       return showError({
         code: 'invalid_format',
         message: 'JPEG / PNG / WebP のみ対応しています。',
@@ -438,6 +482,8 @@
       });
     }
     if (file.size > MAX_FILE_SIZE) {
+      userIsWaiting = false;
+      if (cvStatus) cvStatus.hidden = true;
       return showError({
         code: 'file_too_large',
         message: `画像サイズが ${(MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB を超えています。`,
@@ -450,6 +496,8 @@
     try {
       currentImage = await loadImage(file);
     } catch (err) {
+      userIsWaiting = false;
+      if (cvStatus) cvStatus.hidden = true;
       return showError({ code: 'load_failed', message: '画像の読み込みに失敗しました', hint: err.message });
     }
 
@@ -1457,7 +1505,12 @@
     const bar = analysisProgress.querySelector('.progress-bar');
     if (bar) bar.setAttribute('aria-valuenow', String(Math.round(pct)));
   }
-  function hideProgress() { if (analysisProgress) analysisProgress.hidden = true; }
+  function hideProgress() {
+    if (analysisProgress) analysisProgress.hidden = true;
+    // ユーザー待機状態を解除（CVステータスバナーをこれ以上勝手に出さない）
+    userIsWaiting = false;
+    if (cvStatus && cvStatus.dataset.status === 'ready') cvStatus.hidden = true;
+  }
   function showResults() { if (resultsPanel) resultsPanel.hidden = false; }
   function hideResults() { if (resultsPanel) resultsPanel.hidden = true; }
 
@@ -1467,6 +1520,9 @@
    */
   function showError(err) {
     hideProgress(); hideResults();
+    userIsWaiting = false;
+    // 失敗ステータス以外のCVバナーは隠す
+    if (cvStatus && cvStatus.dataset.status !== 'failed') cvStatus.hidden = true;
     if (!errorState) {
       console.error('[diagnose error]', err);
       alert(`${err.message}\n${err.hint || ''}`);
