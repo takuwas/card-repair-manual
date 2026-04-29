@@ -500,6 +500,11 @@ a:hover {
   flex-direction: column;
 }
 
+/* hidden 属性は display:flex に上書きされてしまうため明示的に隠す */
+.search-results[hidden] {
+  display: none !important;
+}
+
 .search-results-header {
   padding: 12px 16px;
   border-bottom: 1px solid var(--color-border);
