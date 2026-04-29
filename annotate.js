@@ -261,6 +261,8 @@
           t.onabort = (e) => reject(e.target.error);
         });
       },
+      // init() 等から DB を事前にオープンするためのエントリポイント
+      open,
     };
   })();
 
