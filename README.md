@@ -11,6 +11,10 @@ card-repair-manual/
 ├── index.html         ← Webサイトのエントリポイント（SPA）
 ├── style.css          ← スタイルシート
 ├── script.js          ← フロントエンドスクリプト
+├── diagnose.html      ← 画像診断ツール（β版）のエントリポイント
+├── diagnose.css       ← 診断ツール専用スタイル
+├── diagnose.js        ← 診断ツール（OpenCV.jsベースのCV処理）
+├── python/            ← 訓練データ前処理 + モデル学習スクリプト群（詳細は python/README.md）
 ├── README.md          ← このファイル
 └── working/           ← 中間生成物（章別出力、検証レポート 等）
 ```
@@ -43,7 +47,7 @@ card-repair-manual/
 ```bash
 cd /path/to/card-repair-manual
 git init
-git add index.html style.css script.js manual.md source.md README.md
+git add index.html style.css script.js manual.md source.md README.md diagnose.html diagnose.css diagnose.js python/
 git commit -m "Initial commit: pokeca repair manual"
 
 # GitHub に新規リポジトリを作成（例: card-repair-manual）してから:
@@ -95,6 +99,39 @@ python -m http.server 8000
 # または Node.js
 npx serve .
 ```
+
+## 📷 画像診断ツール（β版）
+
+`diagnose.html` は、カード画像をアップロードして損傷箇所を自動検出し、本マニュアルの該当章へ誘導するツールです。
+
+### 概要
+
+- ブラウザ完結型（画像はサーバーへ送信されません）
+- フェーズ1: **ヒューリスティックCV**（OpenCV.js による反り・凹み・汚れ検出）← 現在公開中
+- フェーズ2: **深層学習モデル**（CNN/Transformer による損傷分類）← 訓練中
+
+### サイトからのアクセス
+
+- トップバー右上の `📷 診断（β）` リンクから開けます
+- マニュアル Chapter 1 冒頭の callout からも遷移可能
+
+### 訓練データの準備（フェーズ2向け）
+
+深層学習モデルの訓練データセット作成と学習スクリプトは `python/` ディレクトリに格納されています。
+
+```bash
+cd python
+# 仮想環境セットアップと依存関係インストール
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# データセット準備・学習の詳細手順は python/README.md を参照
+```
+
+> 📌 **詳細手順**: ディレクトリ構成、アノテーション形式、学習コマンド、モデル評価指標等は **`python/README.md`** を参照してください。
+
+> ⚠️ **データ取り扱い注意**: `python/dataset/` 配下の実画像と `python/models/` 配下の学習済み重みは、リポジトリには含まれません（`.gitignore` で除外）。訓練データは個別に取得・配置する必要があります。
 
 ## ⚙️ カスタマイズ
 

@@ -175,6 +175,43 @@ a:hover {
   background: var(--color-bg-alt);
 }
 
+/* トップバーのナビゲーションリンク（診断ページなど） */
+.topbar-nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  background: var(--color-bg-alt);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.topbar-nav-link:hover {
+  background: var(--color-accent);
+  color: #ffffff;
+  border-color: var(--color-accent);
+  text-decoration: none;
+}
+
+[data-theme="dark"] .topbar-nav-link:hover {
+  color: var(--color-bg);
+}
+
+.topbar-nav-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.topbar-nav-label {
+  font-size: 13px;
+}
+
 /* ============================================================
  * レイアウト
  * ============================================================ */
@@ -637,6 +674,15 @@ a:hover {
 
   .topbar-title {
     font-size: 14px;
+  }
+
+  /* モバイルではラベルを隠してアイコンのみ表示 */
+  .topbar-nav-link {
+    padding: 6px 8px;
+  }
+
+  .topbar-nav-label {
+    display: none;
   }
 
   .layout {

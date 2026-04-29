@@ -19,3 +19,14 @@ node_modules/
 
 # Wrangler ローカルキャッシュ（GitHubには push しない）
 .wrangler/
+
+# Python 訓練環境（実データ・学習済み重みは push しない、README は push する）
+python/dataset/
+python/models/
+python/__pycache__/
+python/**/__pycache__/
+python/.venv/
+python/venv/
+python/.env
+*.pyc
+*.pyo

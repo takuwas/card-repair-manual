@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="ポケモンカードの損傷を画像から自動検出し、修復方法のマニュアル該当章へご案内します。">
+  <title>📷 画像診断（β） | ポケモンカード修復マニュアル</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="diagnose.css">
+
+  <!-- DOMPurify（既存サイトと同じくサニタイズ用） -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <button id="sidebar-toggle" class="sidebar-toggle" aria-label="目次を開く">☰</button>
+  <h1 class="topbar-title">📘 ポケモンカード修復マニュアル <span class="topbar-subtitle">／ 📷 画像診断（β）</span></h1>
+  <div class="topbar-actions">
+    <a href="index.html" class="topbar-link" aria-label="マニュアル本体へ">📖 マニュアル</a>
+    <button id="theme-toggle" class="theme-toggle" aria-label="ダークモード切替">🌙</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside id="sidebar" class="sidebar diagnose-sidebar" aria-label="ナビゲーション">
+    <nav class="toc" aria-label="目次">
+      <div class="diagnose-nav-section">
+        <h3 class="diagnose-nav-title">このページ</h3>
+        <ul>
+          <li><a href="#section-upload">📤 アップロード</a></li>
+          <li><a href="#section-results">🔎 診断結果</a></li>
+          <li><a href="#section-help">💡 撮影のコツ</a></li>
+        </ul>
+      </div>
+      <div class="diagnose-nav-section">
+        <h3 class="diagnose-nav-title">マニュアル本体</h3>
+        <ul>
+          <li><a href="index.html#chapter-1" target="_blank" rel="noopener">Ch.1 クイック診断</a></li>
+          <li><a href="index.html#chapter-2" target="_blank" rel="noopener">Ch.2 NGマトリクス</a></li>
+          <li><a href="index.html#chapter-4" target="_blank" rel="noopener">Ch.4 修復手法カタログ</a></li>
+          <li><a href="index.html#chapter-6" target="_blank" rel="noopener">Ch.6 詳細手順</a></li>
+          <li><a href="index.html#section-6-1" target="_blank" rel="noopener">§6.1 加湿クランプ</a></li>
+          <li><a href="index.html#section-6-2" target="_blank" rel="noopener">§6.2 強加湿クランプ</a></li>
+          <li><a href="index.html#section-6-3" target="_blank" rel="noopener">§6.3 ヒュミドール</a></li>
+          <li><a href="index.html#section-6-5" target="_blank" rel="noopener">§6.5 ヒートペン</a></li>
+          <li><a href="index.html#section-6-7" target="_blank" rel="noopener">§6.7 ヒートプレス</a></li>
+          <li><a href="index.html#chapter-7" target="_blank" rel="noopener">Ch.7 トラブル</a></li>
+        </ul>
+      </div>
+    </nav>
+  </aside>
+
+  <main class="content diagnose-page" id="diagnose-main">
+
+    <section class="diagnose-hero">
+      <h2>📷 カード写真から損傷を自動検出</h2>
+      <p>カードの写真をアップロードすると、損傷の種類・度合いを自動推定し、<br>修復方法のマニュアル該当章へご案内します。</p>
+    </section>
+
+    <div id="demo-banner" class="demo-banner" role="note">
+      <span class="demo-banner-icon" aria-hidden="true">⚠️</span>
+      <div class="demo-banner-body">
+        <strong>これは PoC / デモ版です</strong>
+        <p>現在は OpenCV.js による簡易ヒューリスティック検出を行っています。検出精度には限界があり、誤検出・見逃しが発生します。本番モデル（学習済みDL）は <code>v2.0</code> で実装予定です。修復作業の最終判断は、必ず <a href="index.html#chapter-1" target="_blank" rel="noopener">クイック診断チャート</a> と目視確認で行ってください。</p>
+      </div>
+      <button class="demo-banner-close" aria-label="バナーを閉じる" type="button">×</button>
+    </div>
+
+    <div id="cv-status" class="cv-status" role="status" aria-live="polite">
+      <span class="cv-status-icon" aria-hidden="true">⏳</span>
+      <span class="cv-status-text">検出エンジン (OpenCV.js) を読み込んでいます… <small>初回は10〜20秒かかります</small></span>
+    </div>
+
+    <section id="section-upload" class="upload-zone" tabindex="0" role="button" aria-label="画像をアップロード（クリックまたはドラッグ&ドロップ）">
+      <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" hidden>
+      <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+
+      <div class="upload-zone-inner">
+        <div class="upload-icon" aria-hidden="true">📤</div>
+        <p class="upload-primary">ここに画像をドラッグ&ドロップ<br><small>または下のボタンから</small></p>
+        <div class="upload-actions">
+          <button type="button" class="btn btn-primary" id="btn-select">📁 ファイルを選択</button>
+          <button type="button" class="btn btn-secondary" id="btn-camera">📷 カメラで撮影</button>
+          <button type="button" class="btn btn-tertiary" id="btn-sample">🃏 サンプルで試す</button>
+        </div>
+        <p class="upload-hint">JPEG / PNG / WebP・最大 10MB ／ カードを真上から、明るい背景で撮影してください</p>
+      </div>
+    </section>
+
+    <section id="analysis-progress" class="analysis-progress" hidden role="status" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="progress-text">
+        <strong id="progress-label">画像を解析中…</strong>
+        <p id="progress-step">ステップ 1/4: 画像を読み込み中</p>
+      </div>
+      <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="progress-bar-fill" id="progress-bar-fill" style="width: 0%"></div>
+      </div>
+    </section>
+
+    <section id="section-results" class="results-panel" hidden>
+      <header class="results-header">
+        <h2 id="results-title">🔎 診断結果</h2>
+        <div class="results-actions">
+          <button type="button" class="btn btn-tertiary" id="btn-redo">🔄 別の画像で再診断</button>
+          <button type="button" class="btn btn-secondary" id="btn-export">💾 結果を保存</button>
+        </div>
+      </header>
+
+      <div class="results-meta">
+        <span class="results-meta-pill"><span id="meta-count">0</span> 件の損傷</span>
+        <span class="results-meta-pill">信頼度 <span id="meta-confidence">—</span></span>
+        <span class="results-meta-pill">エンジン <span id="meta-engine">heuristic-cv</span></span>
+      </div>
+
+      <div class="results-grid">
+        <div class="result-image">
+          <h3>📷 アップロード画像</h3>
+          <div class="canvas-wrapper" id="canvas-wrapper">
+            <canvas id="canvas-base" aria-label="アップロードされたカード画像"></canvas>
+            <canvas id="canvas-overlay" aria-label="検出された損傷のハイライト" role="img"></canvas>
+            <div class="canvas-tooltip" id="canvas-tooltip" hidden></div>
+          </div>
+          <p class="canvas-hint">番号バッジをクリックすると右側の詳細にジャンプします</p>
+        </div>
+
+        <div class="result-ideal">
+          <h3>✨ 理想の状態</h3>
+          <div class="ideal-illustration" aria-label="健全なカードの参考イラスト">
+            <div class="ideal-card">
+              <div class="ideal-card-header"></div>
+              <div class="ideal-card-art"></div>
+              <div class="ideal-card-body"></div>
+              <div class="ideal-card-footer"></div>
+              <div class="ideal-checkmark" aria-hidden="true">✓</div>
+            </div>
+          </div>
+          <p class="ideal-caption">表面に折り目・凹み・汚れがなく、四隅が整い、エッジが白浮きしていない状態です。</p>
+        </div>
+
+        <div class="result-list">
+          <h3>📋 検出された損傷 <span id="detection-count" class="detection-count"></span></h3>
+          <div id="detection-list" class="detection-list" aria-live="polite">
+            <!-- detection-card がここに挿入される -->
+          </div>
+        </div>
+      </div>
+
+      <footer class="results-footer">
+        <h3>💡 全体推奨フロー</h3>
+        <p id="overall-recommendation"></p>
+        <ul id="primary-chapter-links" class="primary-chapter-links"></ul>
+      </footer>
+    </section>
+
+    <section id="error-state" class="error-state" hidden role="alert">
+      <div class="error-icon" aria-hidden="true">❌</div>
+      <h2 id="error-title">エラーが発生しました</h2>
+      <p id="error-message"></p>
+      <ul id="error-hints" class="error-hints"></ul>
+      <button type="button" class="btn btn-primary" id="btn-error-retry">🔁 別の画像で再診断</button>
+    </section>
+
+    <section id="section-help" class="help-section">
+      <h2>💡 撮影のコツ</h2>
+      <ul class="help-list">
+        <li><strong>真上から撮影</strong>：斜め撮影だと透視補正できず精度が落ちます</li>
+        <li><strong>暗めの背景</strong>：黒い紙・布の上などカードと背景のコントラストを確保</li>
+        <li><strong>反射を避ける</strong>：蛍光灯の真下を避け、横から自然光が入る場所が理想</li>
+        <li><strong>カードが画面の70%以上</strong>を占めるように寄って撮影</li>
+        <li><strong>ピントを合わせる</strong>：タップしてフォーカスを取ってから撮影</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<footer class="footer">
+  <p>
+    出典: <a href="https://discord.gg/" target="_blank" rel="noopener">CRS Discord「ポケカリペア」</a>
+    ｜ <a href="index.html" target="_self">📘 マニュアル本体へ</a>
+    ｜ Diagnose v0.1.0 (PoC)
+  </p>
+</footer>
+
+<!-- OpenCV.js（非同期ロード） -->
+<script async src="https://docs.opencv.org/4.x/opencv.js" id="opencv-script"></script>
+<script src="diagnose.js" defer></script>
+</body>
+</html>
