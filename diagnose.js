@@ -305,43 +305,67 @@
         setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
         return window.cv;
       }
+
+      // ============================================================
+      // フェーズ1: スクリプトのダウンロード（CDNフォールバック）
+      // ------------------------------------------------------------
+      // ダウンロードはネットワーク要因で失敗しうるので CDN を順に試す。
+      // 各CDN 15秒タイムアウト。スクリプト本体（〜10MB）が落ちてくれば成功。
+      // ============================================================
+      let downloadOK = false;
       let lastErr = null;
       for (let i = 0; i < OPENCV_CDN_URLS.length; i++) {
         const url = OPENCV_CDN_URLS[i];
         const host = new URL(url).hostname;
-        setCvStatus('loading', `⏳ 検出エンジン (OpenCV.js) を読み込み中… (${host})`);
+        setCvStatus('loading', `⏳ 検出エンジンをダウンロード中… (${host})`);
         try {
-          // CDNごとにスクリプトロード15秒・ランタイム初期化15秒の制限
-          // 旧コードは 30s + 30s = 最大60s/CDN。全CDN試すと最大4分間ハングしうるため短縮。
           await loadScript(url, 15000);
-          await waitForOpenCVRuntime(15000);
-          if (!(window.cv && typeof window.cv.Mat === 'function')) {
-            throw new Error('cv.Mat unavailable after load');
-          }
-          cvReady = true;
-          setCvStatus('ready', `✅ 検出エンジン (OpenCV.js) の準備完了 (${host})`);
-          return window.cv;
+          downloadOK = true;
+          break; // 1つでも成功すれば次のフェーズへ
         } catch (err) {
           lastErr = err;
-          console.warn(`[diagnose] OpenCV CDN failed: ${host} (${err.message})`);
-          // 次のCDNを試す前に window.cv をリセット（部分初期化状態を防ぐ）
+          console.warn(`[diagnose] OpenCV CDN download failed: ${host} (${err.message})`);
+          // ダウンロードが落ちたCDNは部分的なwindow.cvが残っているかもしれないのでクリア
           if (window.cv && typeof window.cv.Mat !== 'function') {
             try { delete window.cv; } catch (_) {}
             try { window.cv = undefined; } catch (_) {}
           }
         }
       }
-      cvLoadFailed = true;
-      const msg = '⚠️ OpenCV.js の読み込みに失敗しました（全CDN応答なし）。ネットワーク・広告ブロッカー・拡張機能をご確認ください。';
-      setCvStatus('failed', msg);
-      throw lastErr || new Error('all CDNs failed');
+      if (!downloadOK) {
+        cvLoadFailed = true;
+        setCvStatus('failed', '⚠️ OpenCV.js のダウンロードに失敗しました。ネットワーク／広告ブロッカー／拡張機能をご確認ください。');
+        throw lastErr || new Error('all CDNs failed to download');
+      }
+
+      // ============================================================
+      // フェーズ2: WASM ランタイム初期化（CDN切り替えしない・長タイムアウト）
+      // ------------------------------------------------------------
+      // ダウンロード成功後、WASM(〜10MB) のコンパイル＋実行が走る。これは
+      // デバイス性能依存で 5〜60秒かかりうる。途中でCDNを切り替えても無意味
+      // （既にロード済みのため）。長めのタイムアウトで待つ。
+      // ============================================================
+      setCvStatus('loading', '⏳ 検出エンジンを初期化中…（10〜60秒、初回のみ）');
+      try {
+        await waitForOpenCVRuntime(90000); // 90秒の長タイムアウト
+      } catch (err) {
+        cvLoadFailed = true;
+        setCvStatus('failed', '⚠️ OpenCV.js の初期化に失敗しました（タイムアウト）。デバイス性能・メモリをご確認ください。');
+        throw err;
+      }
+
+      if (!(window.cv && typeof window.cv.Mat === 'function')) {
+        cvLoadFailed = true;
+        setCvStatus('failed', '⚠️ OpenCV.js の初期化に失敗しました（cv.Mat 利用不可）。');
+        throw new Error('cv.Mat still unavailable after runtime init');
+      }
+
+      cvReady = true;
+      setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
+      return window.cv;
     })();
-    // 失敗時は次回の waitForOpenCV() でリトライできるよう、Promise を捕捉してから再投げ
-    cvReadyPromise.catch(() => {
-      // ※ 最後に失敗した Promise をキャッシュし続けると永久に「失敗扱い」になるが、
-      //    リトライしても CDN 全滅状態であれば結果は変わらないので、ここでは再試行しない。
-      //    ユーザーは「ページを再読み込み」が一番確実。
-    });
+    // 失敗時の Unhandled Promise Rejection を抑止
+    cvReadyPromise.catch(() => {});
     return cvReadyPromise;
   }
   // OpenCV.js はサイズが大きく（〜10MB）WASM 初期化でメインスレッドが一瞬重くなる。
@@ -527,8 +551,13 @@
     isHandlingFile = true;
 
     // 全体ウォッチドッグ: 想定外のハングで「解析中…」が出っ放しになるのを防ぐ。
-    // OpenCV ロード(最大4CDN×30s前後) + 解析(数秒) を見込んで余裕を持たせる。
-    const WATCHDOG_MS = 150000; // 150秒 (= 2.5分)
+    // 想定:
+    //   フェーズ1 ダウンロード: 15s × 最大4CDN = 60s
+    //   フェーズ2 WASM初期化:    90s
+    //   フェーズ3 解析:          ~10s
+    //   合計最悪値: ~160s
+    // それを少し超えた余裕として 200s に設定。
+    const WATCHDOG_MS = 200000; // 200秒 (= 3.3分)
     let watchdogFired = false;
     const watchdogTimer = setTimeout(() => {
       watchdogFired = true;
