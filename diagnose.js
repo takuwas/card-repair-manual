@@ -158,6 +158,10 @@
   const guidedCameraStatus = $('guided-camera-status');
   const cameraStepper      = $('camera-stepper');
   const cameraAngleBadge   = $('camera-angle-badge');
+  const cameraOrientation  = $('camera-orientation');
+  const orientationDot     = $('orientation-dot');
+  const orientationTitle   = $('orientation-title');
+  const orientationDetail  = $('orientation-detail');
 
   // 状態
   let currentImage = null;        // HTMLImageElement
@@ -187,6 +191,11 @@
     stepIndex: 0,
     files: [],
     zoomApplied: null,
+    qualityLabel: '',
+    orientationActive: false,
+    orientationPermission: 'unknown',
+    orientation: null,
+    imageCapture: null,
   };
   let cvReady = false;
   let cvLoadFailed = false;
@@ -412,22 +421,32 @@
     guidedCameraState.stepIndex = 0;
     guidedCameraState.files = [];
     guidedCameraState.zoomApplied = null;
+    guidedCameraState.qualityLabel = '';
+    guidedCameraState.orientation = null;
+    guidedCameraState.imageCapture = null;
     guidedCamera.hidden = false;
     document.body.style.overflow = 'hidden';
     updateGuidedCameraUI();
 
     try {
+      await requestDeviceOrientationAccess();
       guidedCameraState.stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: 'environment' },
-          width: { ideal: 1920 },
-          height: { ideal: 1440 },
+          width: { ideal: 4032 },
+          height: { ideal: 3024 },
+          aspectRatio: { ideal: 4 / 3 },
+          frameRate: { ideal: 30 },
+          resizeMode: { ideal: 'none' },
         },
         audio: false,
       });
       guidedCameraVideo.srcObject = guidedCameraState.stream;
       await guidedCameraVideo.play();
+      await requestCameraBestQuality(guidedCameraState.stream);
       await requestCameraZoom2x(guidedCameraState.stream);
+      setupImageCapture(guidedCameraState.stream);
+      startOrientationGuide();
       updateGuidedCameraUI();
     } catch (err) {
       closeGuidedCamera();
@@ -463,13 +482,174 @@
     }
   }
 
+  async function requestCameraBestQuality(stream) {
+    const track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+    if (!track || typeof track.getCapabilities !== 'function' || typeof track.applyConstraints !== 'function') {
+      guidedCameraState.qualityLabel = 'high-quality-fallback';
+      return;
+    }
+    const caps = track.getCapabilities();
+    const advanced = [];
+    if (caps.focusMode && caps.focusMode.includes('continuous')) advanced.push({ focusMode: 'continuous' });
+    if (caps.exposureMode && caps.exposureMode.includes('continuous')) advanced.push({ exposureMode: 'continuous' });
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) advanced.push({ whiteBalanceMode: 'continuous' });
+    const constraints = { advanced };
+    if (caps.width && caps.height) {
+      constraints.width = { ideal: caps.width.max };
+      constraints.height = { ideal: caps.height.max };
+    }
+    try {
+      await track.applyConstraints(constraints);
+    } catch (_) {
+      try {
+        if (advanced.length) await track.applyConstraints({ advanced });
+      } catch (_) {}
+    }
+    const settings = typeof track.getSettings === 'function' ? track.getSettings() : {};
+    guidedCameraState.qualityLabel = settings.width && settings.height
+      ? `${settings.width}x${settings.height}`
+      : 'highest-available';
+  }
+
+  function setupImageCapture(stream) {
+    guidedCameraState.imageCapture = null;
+    const track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+    if (!track || typeof window.ImageCapture !== 'function') return;
+    try {
+      guidedCameraState.imageCapture = new ImageCapture(track);
+    } catch (_) {
+      guidedCameraState.imageCapture = null;
+    }
+  }
+
+  async function captureHighestQualityBlob() {
+    const capture = guidedCameraState.imageCapture;
+    if (capture && typeof capture.takePhoto === 'function') {
+      try {
+        if (typeof capture.getPhotoCapabilities === 'function') {
+          const caps = await capture.getPhotoCapabilities();
+          const settings = {};
+          if (caps.imageWidth && caps.imageWidth.max) settings.imageWidth = caps.imageWidth.max;
+          if (caps.imageHeight && caps.imageHeight.max) settings.imageHeight = caps.imageHeight.max;
+          const photo = await capture.takePhoto(settings);
+          if (photo) return photo;
+        }
+        const photo = await capture.takePhoto();
+        if (photo) return photo;
+      } catch (err) {
+        console.warn('[diagnose] ImageCapture.takePhoto failed, falling back to canvas:', err.message || err);
+      }
+    }
+    return captureVideoFrameBlob();
+  }
+
+  async function captureVideoFrameBlob() {
+    if (!guidedCameraVideo || !guidedCameraCanvas) return null;
+    const vw = guidedCameraVideo.videoWidth;
+    const vh = guidedCameraVideo.videoHeight;
+    if (!vw || !vh) return null;
+    guidedCameraCanvas.width = vw;
+    guidedCameraCanvas.height = vh;
+    guidedCameraCanvas.getContext('2d').drawImage(guidedCameraVideo, 0, 0, vw, vh);
+    return new Promise(resolve => guidedCameraCanvas.toBlob(resolve, 'image/jpeg', 0.98));
+  }
+
+  async function requestDeviceOrientationAccess() {
+    if (!('DeviceOrientationEvent' in window)) {
+      guidedCameraState.orientationPermission = 'unsupported';
+      return false;
+    }
+    const maybeRequest = DeviceOrientationEvent.requestPermission;
+    if (typeof maybeRequest === 'function') {
+      try {
+        const result = await maybeRequest.call(DeviceOrientationEvent);
+        guidedCameraState.orientationPermission = result;
+        return result === 'granted';
+      } catch (_) {
+        guidedCameraState.orientationPermission = 'denied';
+        return false;
+      }
+    }
+    guidedCameraState.orientationPermission = 'granted';
+    return true;
+  }
+
+  function startOrientationGuide() {
+    if (guidedCameraState.orientationActive || guidedCameraState.orientationPermission !== 'granted') {
+      updateOrientationGuide();
+      return;
+    }
+    guidedCameraState.orientationActive = true;
+    window.addEventListener('deviceorientation', handleDeviceOrientation, true);
+    updateOrientationGuide();
+  }
+
+  function stopOrientationGuide() {
+    if (!guidedCameraState.orientationActive) return;
+    guidedCameraState.orientationActive = false;
+    window.removeEventListener('deviceorientation', handleDeviceOrientation, true);
+  }
+
+  function handleDeviceOrientation(event) {
+    const beta = Number.isFinite(event.beta) ? event.beta : null;
+    const gamma = Number.isFinite(event.gamma) ? event.gamma : null;
+    const alpha = Number.isFinite(event.alpha) ? event.alpha : null;
+    guidedCameraState.orientation = { beta, gamma, alpha };
+    updateOrientationGuide();
+  }
+
+  function updateOrientationGuide() {
+    if (!cameraOrientation || !orientationDot || !orientationTitle || !orientationDetail) return;
+    cameraOrientation.classList.remove('is-good', 'is-bad');
+    if (guidedCameraState.orientationPermission === 'unsupported') {
+      orientationTitle.textContent = '角度センサー非対応';
+      orientationDetail.textContent = 'ガイド枠に合わせ、カード面とスマホを平行にしてください。';
+      orientationDot.style.transform = 'translate(-50%, -50%)';
+      return;
+    }
+    if (guidedCameraState.orientationPermission !== 'granted') {
+      orientationTitle.textContent = '角度センサー未許可';
+      orientationDetail.textContent = 'モーション利用を許可すると傾きガイドを表示できます。';
+      orientationDot.style.transform = 'translate(-50%, -50%)';
+      return;
+    }
+    const o = guidedCameraState.orientation;
+    if (!o || o.beta == null || o.gamma == null) {
+      orientationTitle.textContent = '角度を確認中';
+      orientationDetail.textContent = 'スマホをカード面と平行にしてください。';
+      orientationDot.style.transform = 'translate(-50%, -50%)';
+      return;
+    }
+    const pitch = normalizePitchForCamera(o.beta);
+    const roll = clamp(o.gamma, -45, 45);
+    const pitchErr = Math.abs(pitch);
+    const rollErr = Math.abs(roll);
+    const good = pitchErr <= 7 && rollErr <= 7;
+    const bad = pitchErr > 14 || rollErr > 14;
+    if (good) cameraOrientation.classList.add('is-good');
+    else if (bad) cameraOrientation.classList.add('is-bad');
+    const dx = clamp(roll / 18, -1, 1) * 13;
+    const dy = clamp(pitch / 18, -1, 1) * 13;
+    orientationDot.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+    orientationTitle.textContent = good ? '角度OK' : '角度を調整';
+    orientationDetail.textContent = `上下 ${pitch.toFixed(1)}° / 左右 ${roll.toFixed(1)}°。7°以内が目安です。`;
+  }
+
+  function normalizePitchForCamera(beta) {
+    if (!Number.isFinite(beta)) return 0;
+    if (Math.abs(beta) > 45) return beta > 0 ? beta - 90 : beta + 90;
+    return beta;
+  }
+
   function closeGuidedCamera() {
+    stopOrientationGuide();
     if (guidedCameraState.stream) {
       guidedCameraState.stream.getTracks().forEach(t => t.stop());
     }
     guidedCameraState.stream = null;
     guidedCameraState.files = [];
     guidedCameraState.stepIndex = 0;
+    guidedCameraState.imageCapture = null;
     if (guidedCameraVideo) guidedCameraVideo.srcObject = null;
     if (guidedCamera) guidedCamera.hidden = true;
     document.body.style.overflow = '';
@@ -487,15 +667,7 @@
   }
 
   async function captureGuidedCameraFrame() {
-    if (!guidedCameraVideo || !guidedCameraCanvas) return;
-    const vw = guidedCameraVideo.videoWidth;
-    const vh = guidedCameraVideo.videoHeight;
-    if (!vw || !vh) return;
-
-    guidedCameraCanvas.width = vw;
-    guidedCameraCanvas.height = vh;
-    guidedCameraCanvas.getContext('2d').drawImage(guidedCameraVideo, 0, 0, vw, vh);
-    const blob = await new Promise(resolve => guidedCameraCanvas.toBlob(resolve, 'image/jpeg', 0.94));
+    const blob = await captureHighestQualityBlob();
     if (!blob) return;
 
     const step = currentGuidedStep();
@@ -547,8 +719,12 @@
         : guidedCameraState.zoomApplied === false
           ? 'この端末/ブラウザでは2倍望遠を直接指定できないため、通常レンズで撮影します。'
           : '2倍望遠を要求しています。端末非対応の場合は通常レンズで起動します。';
-      guidedCameraStatus.textContent = `${zoomText} カード全体を枠内に入れ、白飛びしない角度で撮影してください。`;
+      const qualityText = guidedCameraState.qualityLabel
+        ? `画質: ${guidedCameraState.qualityLabel}。`
+        : '利用可能な最高画質を要求しています。';
+      guidedCameraStatus.textContent = `${zoomText} ${qualityText} カード全体を枠内に入れ、白飛びしない角度で撮影してください。`;
     }
+    updateOrientationGuide();
   }
 
   // ============================================================

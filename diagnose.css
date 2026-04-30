@@ -313,6 +313,57 @@
   font-size: 12px;
   line-height: 1.45;
 }
+.camera-orientation {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px 0;
+}
+.orientation-indicator {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.28);
+  background:
+    linear-gradient(rgba(255,255,255,0.18), rgba(255,255,255,0.18)) 50% 0 / 1px 100% no-repeat,
+    linear-gradient(90deg, rgba(255,255,255,0.18), rgba(255,255,255,0.18)) 0 50% / 100% 1px no-repeat,
+    rgba(255,255,255,0.06);
+}
+.orientation-dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #fbbf24;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 12px rgba(251, 191, 36, 0.8);
+}
+.camera-orientation.is-good .orientation-dot {
+  background: #22c55e;
+  box-shadow: 0 0 12px rgba(34, 197, 94, 0.8);
+}
+.camera-orientation.is-bad .orientation-dot {
+  background: #ef4444;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.8);
+}
+.orientation-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.orientation-copy strong {
+  font-size: 13px;
+}
+.orientation-copy span {
+  color: rgba(255,255,255,0.68);
+  font-size: 12px;
+  line-height: 1.35;
+}
 .guided-camera-actions {
   display: grid;
   grid-template-columns: 1fr 1.4fr;
@@ -328,7 +379,8 @@
   .guided-camera-panel {
     grid-template-rows: auto auto 1fr auto;
   }
-  .guided-camera-status { display: none; }
+  .guided-camera-status,
+  .camera-orientation { display: none; }
   .camera-guide-card { width: min(42vw, 320px); }
 }
 
