@@ -168,6 +168,170 @@
 @keyframes cvspin { to { transform: rotate(360deg); } }
 .cv-status small { display: block; opacity: 0.7; font-size: 11px; }
 
+/* ----------- ガイド付きカメラ ----------- */
+.guided-camera {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.88);
+  color: #fff;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+}
+.guided-camera-panel {
+  width: min(100vw, 720px);
+  min-height: 100%;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto auto;
+  background: #050505;
+}
+.guided-camera-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+}
+.guided-camera-header h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  border: none !important;
+  padding: 0 !important;
+}
+.guided-camera-header p {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.72);
+}
+.guided-camera-close {
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(255,255,255,0.24);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.08);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.camera-stepper {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  padding: 0 16px 10px;
+}
+.camera-step {
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  padding: 7px 8px;
+  font-size: 11px;
+  color: rgba(255,255,255,0.66);
+  text-align: center;
+}
+.camera-step.is-active {
+  border-color: #52d4ff;
+  color: #fff;
+  background: rgba(82, 212, 255, 0.15);
+}
+.camera-step.is-done {
+  border-color: rgba(34, 197, 94, 0.8);
+  color: #bbf7d0;
+}
+.guided-camera-view {
+  position: relative;
+  overflow: hidden;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.guided-camera-view video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.camera-guide-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.camera-guide-card {
+  position: relative;
+  width: min(74vw, 360px);
+  aspect-ratio: 63 / 88;
+  border: 2px solid rgba(255, 255, 255, 0.72);
+  border-radius: 10px;
+  box-shadow: 0 0 0 999px rgba(0,0,0,0.24);
+}
+.guide-corner {
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  border-color: #52d4ff;
+}
+.guide-corner-tl { left: -3px; top: -3px; border-left: 4px solid; border-top: 4px solid; border-top-left-radius: 9px; }
+.guide-corner-tr { right: -3px; top: -3px; border-right: 4px solid; border-top: 4px solid; border-top-right-radius: 9px; }
+.guide-corner-br { right: -3px; bottom: -3px; border-right: 4px solid; border-bottom: 4px solid; border-bottom-right-radius: 9px; }
+.guide-corner-bl { left: -3px; bottom: -3px; border-left: 4px solid; border-bottom: 4px solid; border-bottom-left-radius: 9px; }
+.guide-center-line {
+  position: absolute;
+  background: rgba(255,255,255,0.34);
+}
+.guide-center-line-v {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+}
+.guide-center-line-h {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+}
+.camera-angle-badge {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255,255,255,0.22);
+  font-size: 13px;
+  font-weight: 700;
+}
+.guided-camera-status {
+  min-height: 38px;
+  padding: 10px 16px;
+  color: rgba(255,255,255,0.76);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.guided-camera-actions {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 10px;
+  padding: 12px 16px 16px;
+}
+.guided-camera-actions .btn {
+  justify-content: center;
+  min-height: 42px;
+}
+
+@media (orientation: landscape) and (max-height: 560px) {
+  .guided-camera-panel {
+    grid-template-rows: auto auto 1fr auto;
+  }
+  .guided-camera-status { display: none; }
+  .camera-guide-card { width: min(42vw, 320px); }
+}
+
 /* ----------- アップロードゾーン ----------- */
 .upload-zone {
   border: 2px dashed var(--color-border);

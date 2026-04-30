@@ -88,6 +88,39 @@
       <span class="cv-status-text">検出エンジン (OpenCV.js) を読み込んでいます… <small>初回は10〜20秒かかります</small></span>
     </div>
 
+    <section id="guided-camera" class="guided-camera" hidden aria-label="カード撮影カメラ">
+      <div class="guided-camera-panel">
+        <header class="guided-camera-header">
+          <div>
+            <h2 id="guided-camera-title">カードを撮影</h2>
+            <p id="guided-camera-subtitle">カードの四隅をガイド枠に合わせてください</p>
+          </div>
+          <button type="button" class="guided-camera-close" id="guided-camera-close" aria-label="カメラを閉じる">×</button>
+        </header>
+        <div class="camera-stepper" id="camera-stepper" aria-label="撮影ステップ"></div>
+        <div class="guided-camera-view">
+          <video id="guided-camera-video" autoplay muted playsinline></video>
+          <canvas id="guided-camera-canvas" hidden></canvas>
+          <div class="camera-guide-overlay" aria-hidden="true">
+            <div class="camera-guide-card">
+              <span class="guide-corner guide-corner-tl"></span>
+              <span class="guide-corner guide-corner-tr"></span>
+              <span class="guide-corner guide-corner-br"></span>
+              <span class="guide-corner guide-corner-bl"></span>
+              <span class="guide-center-line guide-center-line-v"></span>
+              <span class="guide-center-line guide-center-line-h"></span>
+            </div>
+            <div class="camera-angle-badge" id="camera-angle-badge">正面</div>
+          </div>
+        </div>
+        <div class="guided-camera-status" id="guided-camera-status">カメラを起動しています…</div>
+        <div class="guided-camera-actions">
+          <button type="button" class="btn btn-tertiary" id="guided-camera-retake">撮り直し</button>
+          <button type="button" class="btn btn-primary" id="guided-camera-capture">撮影</button>
+        </div>
+      </div>
+    </section>
+
     <section id="section-upload" class="upload-zone" tabindex="0" role="button" aria-label="画像をアップロード（クリックまたはドラッグ&ドロップ）">
       <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" hidden>
       <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
@@ -98,6 +131,7 @@
         <div class="upload-actions">
           <button type="button" class="btn btn-primary" id="btn-select">📁 ファイルを選択</button>
           <button type="button" class="btn btn-secondary" id="btn-camera">📷 カメラで撮影</button>
+          <button type="button" class="btn btn-secondary" id="btn-high-precision">◎ 高精度モード</button>
           <button type="button" class="btn btn-tertiary" id="btn-sample">🃏 サンプルで試す</button>
         </div>
         <p class="upload-hint">JPEG / PNG / WebP・最大 10MB ／ カードを真上から、明るい背景で撮影してください</p>

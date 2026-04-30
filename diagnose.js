@@ -79,7 +79,7 @@
   const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
   const RECT_W = 750, RECT_H = 1050; // 正面化後のサイズ（damage-detection-algorithms.md §1.2）
   const PX_TO_MM_DEFAULT = 63.0 / RECT_W;
-  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260430-viewer-centering';
+  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260430-high-precision';
 
   // ============================================================
   // 検出パラメータ（精度向上用の閾値）
@@ -107,6 +107,7 @@
   const cameraInput        = $('camera-input');
   const btnSelect          = $('btn-select');
   const btnCamera          = $('btn-camera');
+  const btnHighPrecision   = $('btn-high-precision');
   const btnSample          = $('btn-sample');
   const btnRedo            = $('btn-redo');
   const btnExport          = $('btn-export');
@@ -146,6 +147,17 @@
   const metaCount          = $('meta-count');
   const metaConfidence     = $('meta-confidence');
   const metaEngine         = $('meta-engine');
+  const guidedCamera       = $('guided-camera');
+  const guidedCameraVideo  = $('guided-camera-video');
+  const guidedCameraCanvas = $('guided-camera-canvas');
+  const guidedCameraTitle  = $('guided-camera-title');
+  const guidedCameraSubtitle = $('guided-camera-subtitle');
+  const guidedCameraClose  = $('guided-camera-close');
+  const guidedCameraCapture = $('guided-camera-capture');
+  const guidedCameraRetake = $('guided-camera-retake');
+  const guidedCameraStatus = $('guided-camera-status');
+  const cameraStepper      = $('camera-stepper');
+  const cameraAngleBadge   = $('camera-angle-badge');
 
   // 状態
   let currentImage = null;        // HTMLImageElement
@@ -163,6 +175,18 @@
     lastX: 0,
     lastY: 0,
     suppressClick: false,
+  };
+  const PRECISION_STEPS = [
+    { id: 'front', label: '正面', subtitle: 'カードの四隅を枠に合わせ、真上から撮影します。' },
+    { id: 'left', label: '左斜め', subtitle: 'スマホを少し左へずらして、反射と凹みの陰影を変えて撮影します。' },
+    { id: 'right', label: '右斜め', subtitle: 'スマホを少し右へずらして、別角度の陰影を確認します。' },
+  ];
+  const guidedCameraState = {
+    mode: 'single',
+    stream: null,
+    stepIndex: 0,
+    files: [],
+    zoomApplied: null,
   };
   let cvReady = false;
   let cvLoadFailed = false;
@@ -346,8 +370,12 @@
   }
 
   if (btnSelect) btnSelect.addEventListener('click', (e) => { e.stopPropagation(); fileInput.click(); });
-  if (btnCamera) btnCamera.addEventListener('click', (e) => { e.stopPropagation(); cameraInput.click(); });
+  if (btnCamera) btnCamera.addEventListener('click', (e) => { e.stopPropagation(); openGuidedCamera('single'); });
+  if (btnHighPrecision) btnHighPrecision.addEventListener('click', (e) => { e.stopPropagation(); openGuidedCamera('precision'); });
   if (btnSample) btnSample.addEventListener('click', (e) => { e.stopPropagation(); pickSample(); });
+  if (guidedCameraClose) guidedCameraClose.addEventListener('click', closeGuidedCamera);
+  if (guidedCameraRetake) guidedCameraRetake.addEventListener('click', retakeGuidedCameraStep);
+  if (guidedCameraCapture) guidedCameraCapture.addEventListener('click', captureGuidedCameraFrame);
 
   // ファイル input の value をクリアしておくことで、同じファイルを再選択した場合にも change が発火する
   if (fileInput)   fileInput.addEventListener('change', (e) => {
@@ -365,6 +393,163 @@
   if (btnExport) btnExport.addEventListener('click', exportPNG);
   if (btnErrorRetry) btnErrorRetry.addEventListener('click', () => { hideError(); fileInput.click(); });
   setupCanvasViewControls();
+
+  // ============================================================
+  // ガイド付きカメラ / 高精度モード
+  // ============================================================
+  async function openGuidedCamera(mode) {
+    if (!guidedCamera || !guidedCameraVideo || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      if (mode === 'single') cameraInput.click();
+      else showError({
+        code: 'camera_unavailable',
+        message: 'このブラウザではガイド付きカメラを起動できません',
+        hint: 'iPhoneのSafari/Chromeなど、カメラ利用を許可できるブラウザで開いてください。',
+      });
+      return;
+    }
+
+    guidedCameraState.mode = mode === 'precision' ? 'precision' : 'single';
+    guidedCameraState.stepIndex = 0;
+    guidedCameraState.files = [];
+    guidedCameraState.zoomApplied = null;
+    guidedCamera.hidden = false;
+    document.body.style.overflow = 'hidden';
+    updateGuidedCameraUI();
+
+    try {
+      guidedCameraState.stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1440 },
+        },
+        audio: false,
+      });
+      guidedCameraVideo.srcObject = guidedCameraState.stream;
+      await guidedCameraVideo.play();
+      await requestCameraZoom2x(guidedCameraState.stream);
+      updateGuidedCameraUI();
+    } catch (err) {
+      closeGuidedCamera();
+      if (mode === 'single') {
+        cameraInput.click();
+      } else {
+        showError({
+          code: 'camera_unavailable',
+          message: 'カメラを起動できませんでした',
+          hint: err.message || 'ブラウザのカメラ権限を確認してください。',
+        });
+      }
+    }
+  }
+
+  async function requestCameraZoom2x(stream) {
+    const track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+    if (!track || typeof track.getCapabilities !== 'function' || typeof track.applyConstraints !== 'function') {
+      guidedCameraState.zoomApplied = false;
+      return;
+    }
+    const caps = track.getCapabilities();
+    if (!caps || !caps.zoom) {
+      guidedCameraState.zoomApplied = false;
+      return;
+    }
+    const target = clamp(2, caps.zoom.min || 1, caps.zoom.max || 2);
+    try {
+      await track.applyConstraints({ advanced: [{ zoom: target }] });
+      guidedCameraState.zoomApplied = Math.abs(target - 2) < 0.05 ? 2 : target;
+    } catch (_) {
+      guidedCameraState.zoomApplied = false;
+    }
+  }
+
+  function closeGuidedCamera() {
+    if (guidedCameraState.stream) {
+      guidedCameraState.stream.getTracks().forEach(t => t.stop());
+    }
+    guidedCameraState.stream = null;
+    guidedCameraState.files = [];
+    guidedCameraState.stepIndex = 0;
+    if (guidedCameraVideo) guidedCameraVideo.srcObject = null;
+    if (guidedCamera) guidedCamera.hidden = true;
+    document.body.style.overflow = '';
+  }
+
+  function retakeGuidedCameraStep() {
+    if (guidedCameraState.mode !== 'precision') {
+      guidedCameraState.files = [];
+      updateGuidedCameraUI();
+      return;
+    }
+    if (guidedCameraState.files.length) guidedCameraState.files.pop();
+    guidedCameraState.stepIndex = guidedCameraState.files.length;
+    updateGuidedCameraUI();
+  }
+
+  async function captureGuidedCameraFrame() {
+    if (!guidedCameraVideo || !guidedCameraCanvas) return;
+    const vw = guidedCameraVideo.videoWidth;
+    const vh = guidedCameraVideo.videoHeight;
+    if (!vw || !vh) return;
+
+    guidedCameraCanvas.width = vw;
+    guidedCameraCanvas.height = vh;
+    guidedCameraCanvas.getContext('2d').drawImage(guidedCameraVideo, 0, 0, vw, vh);
+    const blob = await new Promise(resolve => guidedCameraCanvas.toBlob(resolve, 'image/jpeg', 0.94));
+    if (!blob) return;
+
+    const step = currentGuidedStep();
+    const file = new File([blob], `camera-${step.id}-${Date.now()}.jpg`, { type: 'image/jpeg' });
+    if (guidedCameraState.mode === 'precision') {
+      guidedCameraState.files.push(file);
+      guidedCameraState.stepIndex = guidedCameraState.files.length;
+      if (guidedCameraState.files.length >= PRECISION_STEPS.length) {
+        const files = guidedCameraState.files.slice();
+        closeGuidedCamera();
+        handlePrecisionFiles(files);
+        return;
+      }
+      updateGuidedCameraUI();
+      return;
+    }
+
+    closeGuidedCamera();
+    handleFile(file);
+  }
+
+  function currentGuidedStep() {
+    return guidedCameraState.mode === 'precision'
+      ? PRECISION_STEPS[Math.min(guidedCameraState.stepIndex, PRECISION_STEPS.length - 1)]
+      : PRECISION_STEPS[0];
+  }
+
+  function updateGuidedCameraUI() {
+    const step = currentGuidedStep();
+    const precision = guidedCameraState.mode === 'precision';
+    if (guidedCameraTitle) guidedCameraTitle.textContent = precision ? '高精度モード' : 'カードを撮影';
+    if (guidedCameraSubtitle) guidedCameraSubtitle.textContent = precision
+      ? `${guidedCameraState.stepIndex + 1}/3: ${step.subtitle}`
+      : 'カードの四隅を枠に合わせ、真上から撮影します。';
+    if (cameraAngleBadge) cameraAngleBadge.textContent = step.label;
+    if (guidedCameraCapture) guidedCameraCapture.textContent = precision
+      ? (guidedCameraState.stepIndex >= PRECISION_STEPS.length - 1 ? '3枚目を撮影して解析' : `${guidedCameraState.stepIndex + 1}枚目を撮影`)
+      : '撮影して解析';
+    if (guidedCameraRetake) guidedCameraRetake.disabled = precision ? guidedCameraState.files.length === 0 : false;
+    if (cameraStepper) {
+      cameraStepper.hidden = !precision;
+      cameraStepper.innerHTML = precision
+        ? PRECISION_STEPS.map((s, i) => `<span class="camera-step ${i < guidedCameraState.files.length ? 'is-done' : i === guidedCameraState.stepIndex ? 'is-active' : ''}">${i + 1}. ${escapeHTML(s.label)}</span>`).join('')
+        : '';
+    }
+    if (guidedCameraStatus) {
+      const zoomText = guidedCameraState.zoomApplied
+        ? `2倍望遠を要求済み（${Number(guidedCameraState.zoomApplied).toFixed(1)}x）。`
+        : guidedCameraState.zoomApplied === false
+          ? 'この端末/ブラウザでは2倍望遠を直接指定できないため、通常レンズで撮影します。'
+          : '2倍望遠を要求しています。端末非対応の場合は通常レンズで起動します。';
+      guidedCameraStatus.textContent = `${zoomText} カード全体を枠内に入れ、白飛びしない角度で撮影してください。`;
+    }
+  }
 
   // ============================================================
   // サンプル選択
@@ -611,6 +796,181 @@
     } finally {
       finish();
     }
+  }
+
+  async function handlePrecisionFiles(files) {
+    files = (files || []).filter(Boolean);
+    if (files.length < 3) return;
+    if (isHandlingFile) {
+      console.warn('[diagnose] precision analysis requested while already running.');
+      return;
+    }
+    isHandlingFile = true;
+    const WATCHDOG_MS = 420000;
+    let watchdogFired = false;
+    const watchdogTimer = setTimeout(() => {
+      watchdogFired = true;
+      isHandlingFile = false;
+      showError({
+        code: 'internal_error',
+        message: '高精度解析がタイムアウトしました',
+        hint: '3枚の解析に時間がかかっています。ページを再読み込みして、通常モードまたは明るい場所で再撮影してください。',
+      });
+    }, WATCHDOG_MS);
+
+    const finish = () => {
+      clearTimeout(watchdogTimer);
+      isHandlingFile = false;
+    };
+
+    try {
+      hideError();
+      userIsWaiting = true;
+      if (!files.every(file => ALLOWED_MIME.includes(file.type))) {
+        showError({ code: 'invalid_format', message: 'JPEG / PNG / WebP のみ対応しています。' });
+        return;
+      }
+      if (files.some(file => file.size > MAX_FILE_SIZE)) {
+        showError({ code: 'file_too_large', message: `画像サイズは1枚あたり ${(MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB 以下にしてください。` });
+        return;
+      }
+
+      if (!cvReady) setCvStatus('loading', '⏳ 検出エンジン (OpenCV.js) を読み込み中…');
+      showProgress(8, '高精度モード: 検出エンジンを準備中', 1);
+      await waitForOpenCV();
+      if (watchdogFired) return;
+
+      const entries = [];
+      for (let i = 0; i < files.length; i++) {
+        const step = PRECISION_STEPS[i] || { id: `view${i + 1}`, label: `${i + 1}枚目` };
+        showProgress(18 + i * 22, `高精度モード: ${step.label}の画像を解析中`, 2);
+        const img = await loadImage(files[i]);
+        if (i === 0) currentImage = img;
+        const result = await analyzeCardFromImage(img, files[i]);
+        if (result && !result.error) entries.push({ file: files[i], img, result, view: step });
+      }
+      if (watchdogFired) return;
+
+      if (!entries.length) {
+        currentImage = await loadImage(files[0]);
+        showFailedPreview();
+        showError({
+          code: 'card_not_found',
+          message: 'カードが認識できません',
+          hints: [
+            '3枚ともカードの四隅が枠内に収まっていますか？',
+            'カードと背景の境界が見える明るさですか？',
+            '2倍望遠または少し離れた位置から撮影していますか？',
+          ],
+        });
+        return;
+      }
+
+      showProgress(88, '高精度モード: 3方向の結果を統合中', 4);
+      const aggregate = aggregatePrecisionResults(entries);
+      currentImage = entries[0].img;
+      currentResult = aggregate;
+      renderResults(aggregate);
+      hideFailedPreview();
+      hideProgress();
+      showResults();
+      requestAnimationFrame(() => {
+        resizeCanvasStageToFit();
+        resetCanvasView();
+      });
+      setTimeout(() => {
+        if (resultsPanel) resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 50);
+    } catch (err) {
+      if (!watchdogFired) {
+        console.error('[diagnose] precision analysis failed:', err);
+        showError({ code: 'internal_error', message: err.message || '高精度解析中にエラーが発生しました' });
+      }
+    } finally {
+      finish();
+    }
+  }
+
+  function aggregatePrecisionResults(entries) {
+    const base = cloneJSON(entries[0].result);
+    const merged = [];
+    entries.forEach((entry) => {
+      (entry.result.detections || []).forEach((d) => {
+        const copy = cloneJSON(d);
+        copy.source_views = [entry.view.label];
+        const existing = merged.find(x => x.type === copy.type && computeDetectionIoU(x, copy) >= 0.32);
+        if (existing) {
+          existing.confidence = clamp(Math.max(existing.confidence || 0, copy.confidence || 0) + 0.08, 0, 1);
+          existing.source_views = Array.from(new Set([...(existing.source_views || []), entry.view.label]));
+          if (severityValue(copy.severity) > severityValue(existing.severity)) existing.severity = copy.severity;
+        } else {
+          merged.push(copy);
+        }
+      });
+    });
+
+    merged.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    const filtered = applyNMS(merged, 0.45).slice(0, 20);
+    filtered.forEach((d, i) => {
+      d.id = `d${i + 1}`;
+      if (d.source_views && d.source_views.length > 1) {
+        d.explanation = `${d.explanation || ''}（高精度モード: ${d.source_views.join('・')}で確認）`;
+      }
+    });
+
+    base.detections = filtered;
+    base.capture_mode = {
+      mode: 'high_precision',
+      views: entries.map(e => e.view.label),
+      note: '正面・左斜め・右斜めの3枚を個別解析し、重複候補を統合しています。',
+    };
+    base.engine = {
+      ...(base.engine || {}),
+      name: `${(base.engine && base.engine.name) || 'opencv-worker'}+multi-angle`,
+      version: '0.4.0',
+    };
+    base.card.centering = choosePrecisionCentering(entries);
+    updateResultSummary(base);
+    return base;
+  }
+
+  function choosePrecisionCentering(entries) {
+    const front = entries[0].result.card && entries[0].result.card.centering;
+    if (front && front.available) return front;
+    return entries
+      .map(e => e.result.card && e.result.card.centering)
+      .filter(c => c && c.available)
+      .sort((a, b) => (b.detection_confidence || 0) - (a.detection_confidence || 0))[0] || { available: false };
+  }
+
+  function updateResultSummary(result) {
+    const order = { mild: 0, light: 1, moderate: 2, severe: 3, critical: 4 };
+    const detections = result.detections || [];
+    const highest = detections.reduce((acc, d) => order[d.severity] > order[acc] ? d.severity : acc, 'mild');
+    const overall = detections.length ? avg(detections.map(d => d.confidence || 0)) : 0;
+    result.summary = {
+      ...(result.summary || {}),
+      total_detections: detections.length,
+      highest_severity: highest,
+      overall_confidence: overall,
+      overall_recommendation: detections.length === 0
+        ? '✅ 高精度モードでも明確な損傷は検出されませんでした。'
+        : `${detections.length} 件の損傷候補を検出しました。高精度モードでは複数角度で確認できた候補の信頼度を上げています。`,
+    };
+  }
+
+  function computeDetectionIoU(a, b) {
+    const ab = bboxNormOf(a);
+    const bb = bboxNormOf(b);
+    return ab && bb ? computeIoU(ab, bb) : 0;
+  }
+
+  function severityValue(severity) {
+    return ({ mild: 0, light: 1, moderate: 2, severe: 3, critical: 4 })[severity] || 0;
+  }
+
+  function cloneJSON(value) {
+    return JSON.parse(JSON.stringify(value));
   }
 
   function loadImage(file) {
@@ -1432,6 +1792,7 @@
           worst_ratio: centering.worstRatio,
           method: centering.method,
           detection_confidence: centering.detection_confidence,
+          stabilized: !!centering.stabilized,
           annotation: centering.annotation,
         } : { available: false },
       },
@@ -1598,6 +1959,7 @@
         );
       note.textContent = `左右の枠幅差は ${hd}%、上下は ${vd}% です。`
         + ` 最も悪い比率は約 ${wr.toFixed(1)}/${(100 - wr).toFixed(1)}、推定グレード ${centering.estimated_grade} です。`
+        + (centering.stabilized ? ' 内部の文字線を拾わないよう、現実的なセンタリング範囲へ補正しています。' : '')
         + ` ※ 画像からの参考値で、正式鑑定結果を保証するものではありません。`;
     }
 
@@ -2158,6 +2520,7 @@
       too_bright:        '⚠️ 画像が明るすぎます',
       blurry:            '⚠️ ピントがずれています',
       model_load_failed: '❌ 検出エンジンの読み込みに失敗',
+      camera_unavailable:'❌ カメラを起動できません',
       sample_load_failed:'❌ サンプル画像の読み込みに失敗',
       no_detections:     'ℹ️ 損傷は検出されませんでした',
       internal_error:    '❌ 予期しないエラーが発生しました',
@@ -2549,12 +2912,13 @@
     const avgStd = variances.length ? variances.reduce((a, b) => a + b, 0) / variances.length : 30;
     const confidence = clamp01(1 - avgStd / 30);
 
-    return {
+    return stabilizeCenteringFrame({
       top, bottom, left, right,
       outer: [0, 0, W, H],
       inner: [innerX1, innerY1, innerX2, innerY2],
       confidence,
-    };
+      method: 'scan',
+    }, W, H);
   }
 
   // 1辺の境界をスキャン: 始点 (sx, sy) から方向 (dx, dy) へ進み、輝度 or 色相が大きく変化する点までの距離を返す
@@ -2606,6 +2970,43 @@
     const m = values.reduce((a, b) => a + b, 0) / values.length;
     const v = values.reduce((a, b) => a + (b - m) * (b - m), 0) / values.length;
     return Math.sqrt(v);
+  }
+
+  function stabilizeCenteringFrame(frame, W, H) {
+    const h = constrainMarginPair(frame.left, frame.right, W * 0.025, W * 0.13);
+    const v = constrainMarginPair(frame.top, frame.bottom, H * 0.018, H * 0.13);
+    if (!h || !v) return null;
+    const stabilized = h.stabilized || v.stabilized;
+    const left = h.a;
+    const right = h.b;
+    const top = v.a;
+    const bottom = v.b;
+    return {
+      ...frame,
+      top,
+      bottom,
+      left,
+      right,
+      inner: [Math.round(left), Math.round(top), Math.round(W - right), Math.round(H - bottom)],
+      confidence: clamp01((frame.confidence || 0) * (stabilized ? 0.82 : 1)),
+      stabilized,
+    };
+  }
+
+  function constrainMarginPair(a, b, minMargin, maxMargin) {
+    if (!isFinite(a) || !isFinite(b) || a <= 0 || b <= 0) return null;
+    let x = clamp(a, minMargin, maxMargin);
+    let y = clamp(b, minMargin, maxMargin);
+    let stabilized = Math.abs(x - a) > 1 || Math.abs(y - b) > 1;
+    const maxRatio = 1.22;
+    const lo = Math.min(x, y);
+    const hi = Math.max(x, y);
+    if (lo > 0 && hi / lo > maxRatio) {
+      if (x > y) x = y * maxRatio;
+      else y = x * maxRatio;
+      stabilized = true;
+    }
+    return { a: x, b: y, stabilized };
   }
 
   /**
@@ -2670,6 +3071,7 @@
         inner_rect: frame.inner,
       },
       detection_confidence: frame.confidence,
+      stabilized: !!frame.stabilized,
     };
   }
 

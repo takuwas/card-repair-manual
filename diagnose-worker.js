@@ -753,9 +753,11 @@
       cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
       cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
       const projected = detectProjectedInnerFrame(gray, hsv, W, H);
-      if (projected && isPlausibleFrame(projected, W, H)) return projected;
+      const projectedStable = projected ? stabilizeCenteringFrame(projected, W, H) : null;
+      if (projectedStable && isPlausibleFrame(projectedStable, W, H)) return projectedStable;
       const scanned = detectScannedInnerFrame(gray, hsv, W, H);
-      return scanned && isPlausibleFrame(scanned, W, H) ? scanned : null;
+      const scannedStable = scanned ? stabilizeCenteringFrame(scanned, W, H) : null;
+      return scannedStable && isPlausibleFrame(scannedStable, W, H) ? scannedStable : null;
     } finally {
       rgb.delete(); gray.delete(); hsv.delete();
     }
@@ -911,6 +913,43 @@
     return frame.confidence >= 0.45 && lrRatio <= 6 && tbRatio <= 4.5;
   }
 
+  function stabilizeCenteringFrame(frame, W, H) {
+    const h = constrainMarginPair(frame.left, frame.right, W * 0.025, W * 0.13);
+    const v = constrainMarginPair(frame.top, frame.bottom, H * 0.018, H * 0.13);
+    if (!h || !v) return null;
+    const stabilized = h.stabilized || v.stabilized;
+    const left = h.a;
+    const right = h.b;
+    const top = v.a;
+    const bottom = v.b;
+    return {
+      ...frame,
+      top,
+      bottom,
+      left,
+      right,
+      inner: [Math.round(left), Math.round(top), Math.round(W - right), Math.round(H - bottom)],
+      confidence: clamp01((frame.confidence || 0) * (stabilized ? 0.82 : 1)),
+      stabilized,
+    };
+  }
+
+  function constrainMarginPair(a, b, minMargin, maxMargin) {
+    if (!isFinite(a) || !isFinite(b) || a <= 0 || b <= 0) return null;
+    let x = clamp(a, minMargin, maxMargin);
+    let y = clamp(b, minMargin, maxMargin);
+    let stabilized = Math.abs(x - a) > 1 || Math.abs(y - b) > 1;
+    const maxRatio = 1.22; // 約55/45。センタリング線が内部テキスト線へ飛ぶのを防ぐ。
+    const lo = Math.min(x, y);
+    const hi = Math.max(x, y);
+    if (lo > 0 && hi / lo > maxRatio) {
+      if (x > y) x = y * maxRatio;
+      else y = x * maxRatio;
+      stabilized = true;
+    }
+    return { a: x, b: y, stabilized };
+  }
+
   function computeCentering(frame) {
     const { top, bottom, left, right } = frame;
     const horizSum = left + right;
@@ -942,6 +981,7 @@
       annotation: { outer_rect: frame.outer, inner_rect: frame.inner },
       detection_confidence: frame.confidence,
       method: frame.method,
+      stabilized: !!frame.stabilized,
     };
   }
 
