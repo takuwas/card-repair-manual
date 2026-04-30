@@ -15,9 +15,11 @@
 
   const DETECT_PARAMS = {
     textZones: [
-      { name: 'top_text', y1: 0.00, y2: 0.18 },
-      { name: 'bottom_text', y1: 0.62, y2: 0.95 },
-      { name: 'footer', y1: 0.93, y2: 1.00 },
+      { name: 'top_text', y1: 0.00, y2: 0.16, strength: 0.10 },
+      { name: 'art_caption', y1: 0.46, y2: 0.56, strength: 0.08 },
+      { name: 'attack_text', y1: 0.56, y2: 0.83, strength: 0.10 },
+      { name: 'bottom_rules', y1: 0.82, y2: 0.93, strength: 0.08 },
+      { name: 'footer', y1: 0.91, y2: 1.00, strength: 0.08 },
     ],
     confidenceFloor: 0.12,
     confidenceFloorByType: {
@@ -650,17 +652,18 @@
         const minRect = cv.minAreaRect(cnt);
         const rectArea = minRect.size.width * minRect.size.height;
         const fillRatio = rectArea > 0 ? hullArea / rectArea : 1;
+        if (fillRatio > 0.94) return null;
         const maxDevPx = Math.max(0, (1 - fillRatio) * minRect.size.width);
         const warpMm = maxDevPx * (63.0 / RECT_W);
         let severity = null;
-        if (warpMm >= 1.5) severity = 'severe';
-        else if (warpMm >= 0.5) severity = 'moderate';
-        else if (warpMm >= 0.2) severity = 'light';
+        if (warpMm >= 5.0) severity = 'severe';
+        else if (warpMm >= 3.5) severity = 'moderate';
+        else if (warpMm >= 2.0) severity = 'light';
         return severity ? {
           type: 'warp',
           severity,
-          confidence: Math.min(1, warpMm / 2),
-          metrics: { max_deviation_mm: warpMm },
+          confidence: Math.min(1, (warpMm - 1.5) / 4),
+          metrics: { max_deviation_mm: warpMm, contour_fill_ratio: fillRatio },
           geom: { kind: 'card_global' },
         } : null;
       } finally {
@@ -749,64 +752,196 @@
       cv.cvtColor(rectMat, rgb, cv.COLOR_RGBA2RGB);
       cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
       cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
-      const SAMPLES = 21;
-      const topVals = [], bottomVals = [], leftVals = [], rightVals = [];
-      for (let i = 1; i < SAMPLES - 1; i++) {
-        const x = Math.round((i / SAMPLES) * W);
-        const y = Math.round((i / SAMPLES) * H);
-        const t = scanForFrameBoundary(gray, hsv, x, 0, 0, 1, Math.floor(H * 0.2), Math.floor(H * 0.005));
-        const b = scanForFrameBoundary(gray, hsv, x, H - 1, 0, -1, Math.floor(H * 0.2), Math.floor(H * 0.005));
-        const l = scanForFrameBoundary(gray, hsv, 0, y, 1, 0, Math.floor(W * 0.2), Math.floor(W * 0.005));
-        const r = scanForFrameBoundary(gray, hsv, W - 1, y, -1, 0, Math.floor(W * 0.2), Math.floor(W * 0.005));
-        if (t != null) topVals.push(t);
-        if (b != null) bottomVals.push(b);
-        if (l != null) leftVals.push(l);
-        if (r != null) rightVals.push(r);
-      }
-      const top = robustMedian(topVals), bottom = robustMedian(bottomVals);
-      const left = robustMedian(leftVals), right = robustMedian(rightVals);
-      if (top == null || bottom == null || left == null || right == null) return null;
-      if (top + bottom < 4 || left + right < 4) return null;
-      const variances = [stdOf(topVals), stdOf(bottomVals), stdOf(leftVals), stdOf(rightVals)].filter(v => v != null);
-      const avgStd = variances.length ? variances.reduce((a, b) => a + b, 0) / variances.length : 30;
-      return {
-        top, bottom, left, right,
-        outer: [0, 0, W, H],
-        inner: [Math.round(left), Math.round(top), Math.round(W - right), Math.round(H - bottom)],
-        confidence: clamp01(1 - avgStd / 30),
-      };
+      const projected = detectProjectedInnerFrame(gray, hsv, W, H);
+      if (projected && isPlausibleFrame(projected, W, H)) return projected;
+      const scanned = detectScannedInnerFrame(gray, hsv, W, H);
+      return scanned && isPlausibleFrame(scanned, W, H) ? scanned : null;
     } finally {
       rgb.delete(); gray.delete(); hsv.delete();
     }
+  }
+
+  function detectProjectedInnerFrame(gray, hsv, W, H) {
+    const left = findBoundaryByProjection(gray, hsv, 'x',
+      Math.round(W * 0.025), Math.round(W * 0.25),
+      Math.round(H * 0.10), Math.round(H * 0.90), false);
+    const right = findBoundaryByProjection(gray, hsv, 'x',
+      Math.round(W * 0.75), Math.round(W * 0.975),
+      Math.round(H * 0.10), Math.round(H * 0.90), true);
+    const top = findBoundaryByProjection(gray, hsv, 'y',
+      Math.round(H * 0.025), Math.round(H * 0.24),
+      Math.round(W * 0.12), Math.round(W * 0.88), false);
+    const bottom = findBoundaryByProjection(gray, hsv, 'y',
+      Math.round(H * 0.76), Math.round(H * 0.975),
+      Math.round(W * 0.12), Math.round(W * 0.88), true);
+
+    if (!left || !right || !top || !bottom) return null;
+    const frame = {
+      top: top.pos,
+      bottom: H - bottom.pos,
+      left: left.pos,
+      right: W - right.pos,
+      outer: [0, 0, W, H],
+      inner: [Math.round(left.pos), Math.round(top.pos), Math.round(right.pos), Math.round(bottom.pos)],
+      confidence: clamp01((left.confidence + right.confidence + top.confidence + bottom.confidence) / 4),
+      method: 'projection',
+    };
+    return frame;
+  }
+
+  function detectScannedInnerFrame(gray, hsv, W, H) {
+    const SAMPLES = 21;
+    const topVals = [], bottomVals = [], leftVals = [], rightVals = [];
+    for (let i = 1; i < SAMPLES - 1; i++) {
+      const x = Math.round((i / SAMPLES) * W);
+      const y = Math.round((i / SAMPLES) * H);
+      const t = scanForFrameBoundary(gray, hsv, x, 0, 0, 1, Math.floor(H * 0.2), Math.floor(H * 0.005));
+      const b = scanForFrameBoundary(gray, hsv, x, H - 1, 0, -1, Math.floor(H * 0.2), Math.floor(H * 0.005));
+      const l = scanForFrameBoundary(gray, hsv, 0, y, 1, 0, Math.floor(W * 0.2), Math.floor(W * 0.005));
+      const r = scanForFrameBoundary(gray, hsv, W - 1, y, -1, 0, Math.floor(W * 0.2), Math.floor(W * 0.005));
+      if (t != null) topVals.push(t);
+      if (b != null) bottomVals.push(b);
+      if (l != null) leftVals.push(l);
+      if (r != null) rightVals.push(r);
+    }
+    const top = robustMedian(topVals), bottom = robustMedian(bottomVals);
+    const left = robustMedian(leftVals), right = robustMedian(rightVals);
+    if (top == null || bottom == null || left == null || right == null) return null;
+    const variances = [stdOf(topVals), stdOf(bottomVals), stdOf(leftVals), stdOf(rightVals)].filter(v => v != null);
+    const avgStd = variances.length ? variances.reduce((a, b) => a + b, 0) / variances.length : 30;
+    return {
+      top, bottom, left, right,
+      outer: [0, 0, W, H],
+      inner: [Math.round(left), Math.round(top), Math.round(W - right), Math.round(H - bottom)],
+      confidence: clamp01(1 - avgStd / 30),
+      method: 'scan',
+    };
+  }
+
+  function findBoundaryByProjection(gray, hsv, axis, start, end, bandStart, bandEnd, reverse) {
+    const step = 2;
+    const positions = [];
+    if (reverse) {
+      for (let p = end; p >= start; p -= step) positions.push(p);
+    } else {
+      for (let p = start; p <= end; p += step) positions.push(p);
+    }
+    if (!positions.length) return null;
+
+    const raw = positions.map(pos => projectionScoreAt(gray, hsv, axis, pos, bandStart, bandEnd));
+    const scores = smoothScores(raw, 2);
+    const median = percentile(scores, 0.5);
+    const p90 = percentile(scores, 0.9);
+    const maxScore = Math.max(...scores);
+    const threshold = Math.max(7, median + 4, median + (p90 - median) * 0.55);
+    if (maxScore < threshold) return null;
+
+    let best = -1;
+    for (let i = 0; i < scores.length; i++) {
+      if (scores[i] < threshold) continue;
+      best = i;
+      const limit = Math.min(scores.length - 1, i + 8);
+      for (let j = i + 1; j <= limit; j++) {
+        if (scores[j] < threshold * 0.82) break;
+        if (scores[j] > scores[best]) best = j;
+      }
+      break;
+    }
+    if (best < 0) best = scores.indexOf(maxScore);
+    return {
+      pos: positions[best],
+      score: scores[best],
+      confidence: clamp01(0.4 + (scores[best] - threshold) / 26),
+    };
+  }
+
+  function projectionScoreAt(gray, hsv, axis, pos, bandStart, bandEnd) {
+    const W = gray.cols, H = gray.rows;
+    const vals = [];
+    const step = 4;
+    if (axis === 'x') {
+      const x1 = clamp(Math.round(pos - 1), 0, W - 1);
+      const x2 = clamp(Math.round(pos + 1), 0, W - 1);
+      for (let y = bandStart; y <= bandEnd; y += step) {
+        vals.push(pixelEdgeScore(gray, hsv, x1, y, x2, y));
+      }
+    } else {
+      const y1 = clamp(Math.round(pos - 1), 0, H - 1);
+      const y2 = clamp(Math.round(pos + 1), 0, H - 1);
+      for (let x = bandStart; x <= bandEnd; x += step) {
+        vals.push(pixelEdgeScore(gray, hsv, x, y1, x, y2));
+      }
+    }
+    return percentile(vals, 0.65);
+  }
+
+  function pixelEdgeScore(gray, hsv, x1, y1, x2, y2) {
+    const W = gray.cols;
+    const idx1 = (y1 * W + x1) * 3;
+    const idx2 = (y2 * W + x2) * 3;
+    const dG = Math.abs(gray.ucharAt(y1, x1) - gray.ucharAt(y2, x2));
+    let dH = Math.abs(hsv.data[idx1] - hsv.data[idx2]);
+    dH = Math.min(dH, 180 - dH);
+    const dS = Math.abs(hsv.data[idx1 + 1] - hsv.data[idx2 + 1]);
+    return dG + dS * 0.45 + dH * 0.25;
+  }
+
+  function smoothScores(values, radius) {
+    return values.map((_, i) => {
+      let sum = 0, count = 0;
+      for (let j = Math.max(0, i - radius); j <= Math.min(values.length - 1, i + radius); j++) {
+        sum += values[j];
+        count++;
+      }
+      return count ? sum / count : values[i];
+    });
+  }
+
+  function isPlausibleFrame(frame, W, H) {
+    if (!frame) return false;
+    const { top, bottom, left, right } = frame;
+    if ([top, bottom, left, right].some(v => !isFinite(v) || v <= 0)) return false;
+    const innerW = W - left - right;
+    const innerH = H - top - bottom;
+    if (innerW < W * 0.55 || innerW > W * 0.96) return false;
+    if (innerH < H * 0.55 || innerH > H * 0.96) return false;
+    if (left < W * 0.015 || right < W * 0.015 || top < H * 0.015 || bottom < H * 0.015) return false;
+    const lrRatio = Math.max(left, right) / Math.max(1, Math.min(left, right));
+    const tbRatio = Math.max(top, bottom) / Math.max(1, Math.min(top, bottom));
+    return frame.confidence >= 0.45 && lrRatio <= 6 && tbRatio <= 4.5;
   }
 
   function computeCentering(frame) {
     const { top, bottom, left, right } = frame;
     const horizSum = left + right;
     const vertSum = top + bottom;
+    if (horizSum <= 0 || vertSum <= 0) return null;
     const leftPct = (left / horizSum) * 100;
     const rightPct = (right / horizSum) * 100;
     const topPct = (top / vertSum) * 100;
     const bottomPct = (bottom / vertSum) * 100;
     const horizDev = Math.abs(left - right) / horizSum * 100;
     const vertDev = Math.abs(top - bottom) / vertSum * 100;
-    const worstRatio = 50 + Math.max(horizDev, vertDev) / 2;
+    const worstRatio = Math.max(leftPct, rightPct, topPct, bottomPct);
     let estimatedGrade;
     if (worstRatio <= 55) estimatedGrade = 'GEM MINT 10';
     else if (worstRatio <= 60) estimatedGrade = 'MINT 9';
     else if (worstRatio <= 65) estimatedGrade = 'NM-MT 8';
     else if (worstRatio <= 70) estimatedGrade = 'NM 7';
-    else if (worstRatio <= 75) estimatedGrade = 'EX-MT 6';
-    else if (worstRatio <= 80) estimatedGrade = 'EX 5';
-    else estimatedGrade = 'VG-EX or below';
+    else if (worstRatio <= 80) estimatedGrade = 'EX-MT 6';
+    else if (worstRatio <= 85) estimatedGrade = 'EX 5/4';
+    else if (worstRatio <= 90) estimatedGrade = 'VG or lower';
+    else estimatedGrade = 'OC';
     return {
       horizontal: { leftPx: left, rightPx: right, leftPercent: leftPct, rightPercent: rightPct, deviation: horizDev, label: `${Math.round(leftPct)}/${Math.round(rightPct)}` },
       vertical: { topPx: top, bottomPx: bottom, topPercent: topPct, bottomPercent: bottomPct, deviation: vertDev, label: `${Math.round(topPct)}/${Math.round(bottomPct)}` },
       estimatedGrade,
-      overallScore: Math.max(0, Math.round(100 - Math.max(horizDev, vertDev) * 2)),
+      overallScore: Math.max(0, Math.round(100 - (worstRatio - 50) * 2)),
       worstDeviation: Math.max(horizDev, vertDev),
+      worstRatio,
       annotation: { outer_rect: frame.outer, inner_rect: frame.inner },
       detection_confidence: frame.confidence,
+      method: frame.method,
     };
   }
 
@@ -946,21 +1081,48 @@
   function applyLayoutMask(d, holoInfo) {
     const bbox = bboxNormOf(d);
     if (!bbox) return;
-    const [, ny1, , ny2] = bbox;
+    const [nx1, ny1, nx2, ny2] = bbox;
     const cy = (ny1 + ny2) / 2;
+    const bw = Math.max(0, nx2 - nx1);
+    const bh = Math.max(0, ny2 - ny1);
+    const area = bw * bh;
     for (const z of DETECT_PARAMS.textZones) {
-      if (cy >= z.y1 && cy <= z.y2) {
-        d.confidence = (d.confidence || 0) * (d.type === 'crease' ? 0.7 : 0.5);
+      const overlap = overlapRatio1D(ny1, ny2, z.y1, z.y2);
+      if (cy >= z.y1 && cy <= z.y2 || overlap >= 0.35) {
+        if (d.type === 'indent') {
+          const areaMm2 = d.metrics && Number.isFinite(d.metrics.area_mm2) ? d.metrics.area_mm2 : 0;
+          const smallTextBlob = areaMm2 < 30 && (area < 0.018 || bh < 0.055);
+          d.confidence = (d.confidence || 0) * (smallTextBlob ? z.strength : 0.9);
+          d.metrics = { ...(d.metrics || {}), layout_suppressed: z.name };
+        } else if (d.type === 'crease') {
+          d.confidence = (d.confidence || 0) * (isPrintedRuleLine(d) ? 0.35 : 0.75);
+          d.metrics = { ...(d.metrics || {}), layout_suppressed: z.name };
+        } else {
+          d.confidence = (d.confidence || 0) * 0.55;
+        }
         break;
       }
     }
     if (holoInfo && holoInfo.is_holographic && holoInfo.area_norm && d.type !== 'crease') {
-      const [nx1, ny1b, nx2, ny2b] = bbox;
       const cx = (nx1 + nx2) / 2;
-      const cy2 = (ny1b + ny2b) / 2;
+      const cy2 = (ny1 + ny2) / 2;
       const [hx1, hy1, hx2, hy2] = holoInfo.area_norm;
       if (cx >= hx1 && cx <= hx2 && cy2 >= hy1 && cy2 <= hy2) d.confidence = (d.confidence || 0) * 0.7;
     }
+  }
+
+  function isPrintedRuleLine(d) {
+    if (!d.geom || d.geom.kind !== 'polyline' || !d.geom.points_norm) return false;
+    const [[x1, y1], [x2, y2]] = d.geom.points_norm;
+    const dx = Math.abs(x2 - x1);
+    const dy = Math.abs(y2 - y1);
+    const length = Math.hypot(dx, dy);
+    return length > 0.08 && (dy / (dx || 1e-9)) < 0.16;
+  }
+
+  function overlapRatio1D(a1, a2, b1, b2) {
+    const inter = Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
+    return inter / Math.max(1e-9, a2 - a1);
   }
 
   function detectionFloor(d) {
@@ -1020,6 +1182,13 @@
     const trim = Math.floor(sorted.length * 0.1);
     const trimmed = sorted.slice(trim, sorted.length - trim);
     return (trimmed.length ? trimmed : sorted)[Math.floor((trimmed.length ? trimmed : sorted).length / 2)];
+  }
+
+  function percentile(values, p) {
+    if (!values || !values.length) return 0;
+    const sorted = values.slice().sort((a, b) => a - b);
+    const idx = clamp(Math.round((sorted.length - 1) * p), 0, sorted.length - 1);
+    return sorted[idx];
   }
 
   function polygonArea(points) {

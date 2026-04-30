@@ -79,6 +79,7 @@
   const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
   const RECT_W = 750, RECT_H = 1050; // 正面化後のサイズ（damage-detection-algorithms.md §1.2）
   const PX_TO_MM_DEFAULT = 63.0 / RECT_W;
+  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260430-viewer-centering';
 
   // ============================================================
   // 検出パラメータ（精度向上用の閾値）
@@ -86,9 +87,11 @@
   const DETECT_PARAMS = {
     // テキスト密度の高い領域（信頼度を減衰させる）
     textZones: [
-      { name: 'top_text',    y1: 0.00, y2: 0.18 },  // ポケモン名・HP
-      { name: 'bottom_text', y1: 0.62, y2: 0.95 },  // わざ・効果テキスト
-      { name: 'footer',      y1: 0.93, y2: 1.00 },  // 弱点・コレクター情報
+      { name: 'top_text',    y1: 0.00, y2: 0.16, strength: 0.10 },  // ポケモン名・HP
+      { name: 'art_caption', y1: 0.46, y2: 0.56, strength: 0.08 },  // 図鑑バー・銀色の区切り
+      { name: 'attack_text', y1: 0.56, y2: 0.83, strength: 0.10 },  // わざ・効果テキスト
+      { name: 'bottom_rules',y1: 0.82, y2: 0.93, strength: 0.08 },  // 弱点・抵抗力・逃げる
+      { name: 'footer',      y1: 0.91, y2: 1.00, strength: 0.08 },  // コレクター情報
     ],
     artworkZone: { y1: 0.18, y2: 0.55 },  // アートワーク中央
     confidenceFloor: 0.12,  // これ未満は棄却（baseline検出の最低品質）
@@ -123,7 +126,16 @@
   const errorHints         = $('error-hints');
   const canvasBase         = $('canvas-base');
   const canvasOverlay      = $('canvas-overlay');
+  const canvasWrapper      = $('canvas-wrapper');
+  const canvasStage        = $('canvas-stage');
   const canvasTooltip      = $('canvas-tooltip');
+  const canvasZoomOut      = $('canvas-zoom-out');
+  const canvasZoomIn       = $('canvas-zoom-in');
+  const canvasZoomRange    = $('canvas-zoom-range');
+  const canvasRotateLeft   = $('canvas-rotate-left');
+  const canvasRotateRight  = $('canvas-rotate-right');
+  const canvasResetView    = $('canvas-reset-view');
+  const canvasZoomValue    = $('canvas-zoom-value');
   const failedPreview      = $('failed-preview');
   const failedPreviewCanvas = $('failed-preview-canvas');
   const demoBanner         = $('demo-banner');
@@ -140,6 +152,18 @@
   let currentResult = null;       // 検出結果 JSON
   let currentDetections = [];     // 描画用（ピクセル座標）
   let currentCenteringOverlayEnabled = true;
+  const canvasView = {
+    scale: 1,
+    rotation: 0,
+    panX: 0,
+    panY: 0,
+    dragging: false,
+    moved: false,
+    pointerId: null,
+    lastX: 0,
+    lastY: 0,
+    suppressClick: false,
+  };
   let cvReady = false;
   let cvLoadFailed = false;
   let cvReadyPromise = null;
@@ -223,7 +247,7 @@
 
   function getDiagnoseWorker() {
     if (diagnoseWorker) return diagnoseWorker;
-    diagnoseWorker = new Worker('diagnose-worker.js');
+    diagnoseWorker = new Worker(DIAGNOSE_WORKER_URL);
     diagnoseWorker.onmessage = (event) => {
       const msg = event.data || {};
       const pending = workerPending.get(msg.requestId);
@@ -340,6 +364,7 @@
   if (btnRedo) btnRedo.addEventListener('click', () => { hideResults(); fileInput.click(); });
   if (btnExport) btnExport.addEventListener('click', exportPNG);
   if (btnErrorRetry) btnErrorRetry.addEventListener('click', () => { hideError(); fileInput.click(); });
+  setupCanvasViewControls();
 
   // ============================================================
   // サンプル選択
@@ -576,6 +601,10 @@
       hideFailedPreview();
       hideProgress();
       showResults();
+      requestAnimationFrame(() => {
+        resizeCanvasStageToFit();
+        resetCanvasView();
+      });
       setTimeout(() => {
         if (resultsPanel) resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 50);
@@ -1286,13 +1315,14 @@
     cv.approxPolyDP(cnt, approx, 0.01 * peri, true);
 
     let maxDevPx = 0;
+    let fillRatio = 1;
     if (approx.rows >= 4) {
       const hull = new cv.Mat();
       cv.convexHull(cnt, hull);
       const hullArea = cv.contourArea(hull);
       const minRect = cv.minAreaRect(cnt);
       const rectArea = minRect.size.width * minRect.size.height;
-      const fillRatio = rectArea > 0 ? hullArea / rectArea : 1;
+      fillRatio = rectArea > 0 ? hullArea / rectArea : 1;
       maxDevPx = Math.max(0, (1.0 - fillRatio) * minRect.size.width);
       hull.delete();
     }
@@ -1301,9 +1331,11 @@
     const warpMm = maxDevPx * PX_TO_MM;
 
     let severity = null;
-    if (warpMm >= 1.5) severity = 'severe';
-    else if (warpMm >= 0.5) severity = 'moderate';
-    else if (warpMm >= 0.2) severity = 'light';
+    if (fillRatio <= 0.94) {
+      if (warpMm >= 5.0) severity = 'severe';
+      else if (warpMm >= 3.5) severity = 'moderate';
+      else if (warpMm >= 2.0) severity = 'light';
+    }
 
     cnt.delete();
     approx.delete();
@@ -1313,8 +1345,8 @@
     return {
       type: 'warp',
       severity,
-      confidence: Math.min(1.0, warpMm / 2),
-      metrics: { max_deviation_mm: warpMm },
+      confidence: Math.min(1.0, (warpMm - 1.5) / 4),
+      metrics: { max_deviation_mm: warpMm, contour_fill_ratio: fillRatio },
       geom: { kind: 'card_global' },
     };
   }
@@ -1397,6 +1429,9 @@
           },
           estimated_grade: centering.estimatedGrade,
           score_0_100: centering.overallScore,
+          worst_ratio: centering.worstRatio,
+          method: centering.method,
+          detection_confidence: centering.detection_confidence,
           annotation: centering.annotation,
         } : { available: false },
       },
@@ -1428,6 +1463,7 @@
   function renderResults(result) {
     currentDetections = result.detections;
     drawCanvas(currentImage, result.detections, result.card && result.card.centering);
+    resetCanvasView();
 
     if (metaCount)      metaCount.textContent = result.summary.total_detections;
     if (metaConfidence) metaConfidence.textContent = result.summary.total_detections
@@ -1552,9 +1588,17 @@
     if (note) {
       const hd = centering.horizontal.deviation_pct.toFixed(1);
       const vd = centering.vertical.deviation_pct.toFixed(1);
+      const wr = Number.isFinite(centering.worst_ratio)
+        ? centering.worst_ratio
+        : Math.max(
+          centering.horizontal.left_px / (centering.horizontal.left_px + centering.horizontal.right_px) * 100,
+          centering.horizontal.right_px / (centering.horizontal.left_px + centering.horizontal.right_px) * 100,
+          centering.vertical.top_px / (centering.vertical.top_px + centering.vertical.bottom_px) * 100,
+          centering.vertical.bottom_px / (centering.vertical.top_px + centering.vertical.bottom_px) * 100,
+        );
       note.textContent = `左右の枠幅差は ${hd}%、上下は ${vd}% です。`
-        + ` 推定グレード ${centering.estimated_grade}（最も悪い軸を基準）。`
-        + ` ※ あくまで参考値で、PSA等の正式鑑定は別途必要です。`;
+        + ` 最も悪い比率は約 ${wr.toFixed(1)}/${(100 - wr).toFixed(1)}、推定グレード ${centering.estimated_grade} です。`
+        + ` ※ 画像からの参考値で、正式鑑定結果を保証するものではありません。`;
     }
 
     // オーバーレイトグル
@@ -1639,6 +1683,150 @@
   // ============================================================
   // Canvas 描画
   // ============================================================
+  function setupCanvasViewControls() {
+    if (!canvasWrapper || !canvasStage) return;
+    if (canvasZoomOut) canvasZoomOut.addEventListener('click', () => setCanvasZoom(canvasView.scale / 1.2));
+    if (canvasZoomIn) canvasZoomIn.addEventListener('click', () => setCanvasZoom(canvasView.scale * 1.2));
+    if (canvasZoomRange) {
+      canvasZoomRange.addEventListener('input', () => setCanvasZoom(Number(canvasZoomRange.value) / 100));
+    }
+    if (canvasRotateLeft) canvasRotateLeft.addEventListener('click', () => rotateCanvasView(-90));
+    if (canvasRotateRight) canvasRotateRight.addEventListener('click', () => rotateCanvasView(90));
+    if (canvasResetView) canvasResetView.addEventListener('click', resetCanvasView);
+
+    canvasWrapper.addEventListener('wheel', (e) => {
+      if (!currentResult) return;
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      setCanvasZoom(canvasView.scale * factor);
+    }, { passive: false });
+
+    canvasWrapper.addEventListener('pointerdown', (e) => {
+      if (!currentResult || e.button !== 0) return;
+      canvasView.dragging = true;
+      canvasView.moved = false;
+      canvasView.pointerId = e.pointerId;
+      canvasView.lastX = e.clientX;
+      canvasView.lastY = e.clientY;
+      canvasStage.classList.add('is-dragging');
+      try { canvasWrapper.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+
+    canvasWrapper.addEventListener('pointermove', (e) => {
+      if (!canvasView.dragging || canvasView.pointerId !== e.pointerId) return;
+      const dx = e.clientX - canvasView.lastX;
+      const dy = e.clientY - canvasView.lastY;
+      if (Math.abs(dx) + Math.abs(dy) > 2) canvasView.moved = true;
+      canvasView.panX += dx;
+      canvasView.panY += dy;
+      canvasView.lastX = e.clientX;
+      canvasView.lastY = e.clientY;
+      applyCanvasViewTransform();
+      if (canvasTooltip) canvasTooltip.hidden = true;
+    });
+
+    const endDrag = (e) => {
+      if (!canvasView.dragging || canvasView.pointerId !== e.pointerId) return;
+      canvasView.dragging = false;
+      canvasView.pointerId = null;
+      canvasStage.classList.remove('is-dragging');
+      try { canvasWrapper.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (canvasView.moved) {
+        canvasView.suppressClick = true;
+        setTimeout(() => { canvasView.suppressClick = false; }, 0);
+      }
+    };
+    canvasWrapper.addEventListener('pointerup', endDrag);
+    canvasWrapper.addEventListener('pointercancel', endDrag);
+    window.addEventListener('resize', () => {
+      resizeCanvasStageToFit();
+      applyCanvasViewTransform();
+    });
+  }
+
+  function setCanvasZoom(nextScale) {
+    canvasView.scale = clamp(Number(nextScale) || 1, 0.25, 5);
+    applyCanvasViewTransform();
+  }
+
+  function rotateCanvasView(deltaDeg) {
+    canvasView.rotation = ((canvasView.rotation + deltaDeg) % 360 + 360) % 360;
+    applyCanvasViewTransform();
+  }
+
+  function resetCanvasView() {
+    canvasView.scale = 1;
+    canvasView.rotation = 0;
+    canvasView.panX = 0;
+    canvasView.panY = 0;
+    applyCanvasViewTransform();
+  }
+
+  function applyCanvasViewTransform() {
+    if (!canvasStage) return;
+    const w = canvasStage.clientWidth || canvasStage.offsetWidth || 1;
+    const h = canvasStage.clientHeight || canvasStage.offsetHeight || 1;
+    const rad = canvasView.rotation * Math.PI / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const a = canvasView.scale * cos;
+    const b = canvasView.scale * sin;
+    const c = -canvasView.scale * sin;
+    const d = canvasView.scale * cos;
+    const cx = w / 2;
+    const cy = h / 2;
+    const e = cx + canvasView.panX - a * cx - c * cy;
+    const f = cy + canvasView.panY - b * cx - d * cy;
+    canvasStage.style.transform = `matrix(${a}, ${b}, ${c}, ${d}, ${e}, ${f})`;
+    const pct = Math.round(canvasView.scale * 100);
+    if (canvasZoomRange) canvasZoomRange.value = String(pct);
+    if (canvasZoomValue) canvasZoomValue.textContent = `${pct}%`;
+  }
+
+  function resizeCanvasStageToFit() {
+    if (!canvasWrapper || !canvasStage || !canvasBase || !canvasBase.width || !canvasBase.height) return;
+    const aspect = canvasBase.width / canvasBase.height;
+    const maxW = canvasWrapper.getBoundingClientRect().width || canvasWrapper.clientWidth || canvasBase.width;
+    const maxH = Math.max(260, window.innerHeight * 0.7);
+    let w = maxW;
+    let h = w / aspect;
+    if (h > maxH) {
+      h = maxH;
+      w = h * aspect;
+    }
+    canvasStage.style.width = `${Math.max(1, Math.round(w))}px`;
+    canvasStage.style.height = `${Math.max(1, Math.round(h))}px`;
+  }
+
+  function inverseCanvasViewPoint(clientX, clientY) {
+    if (!canvasWrapper || !canvasStage) return null;
+    const rect = canvasWrapper.getBoundingClientRect();
+    const x = clientX - rect.left - canvasStage.offsetLeft;
+    const y = clientY - rect.top - canvasStage.offsetTop;
+    const w = canvasStage.clientWidth || canvasStage.offsetWidth || 1;
+    const h = canvasStage.clientHeight || canvasStage.offsetHeight || 1;
+    const rad = canvasView.rotation * Math.PI / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const a = canvasView.scale * cos;
+    const b = canvasView.scale * sin;
+    const c = -canvasView.scale * sin;
+    const d = canvasView.scale * cos;
+    const cx = w / 2;
+    const cy = h / 2;
+    const e = cx + canvasView.panX - a * cx - c * cy;
+    const f = cy + canvasView.panY - b * cx - d * cy;
+    const det = a * d - b * c || 1;
+    const px = x - e;
+    const py = y - f;
+    return {
+      x: (d * px - c * py) / det,
+      y: (-b * px + a * py) / det,
+      width: w,
+      height: h,
+    };
+  }
+
   function drawCanvas(img, detections, centering) {
     if (!canvasBase || !canvasOverlay) return;
     const ctxBase = canvasBase.getContext('2d');
@@ -1647,8 +1835,10 @@
     // 表示用の論理ピクセル: 元画像サイズをそのまま使う（CSS で縮小）
     const cw = img.naturalWidth;
     const ch = img.naturalHeight;
+    if (canvasStage) canvasStage.style.setProperty('--canvas-aspect', `${cw} / ${ch}`);
     canvasBase.width = canvasOverlay.width = cw;
     canvasBase.height = canvasOverlay.height = ch;
+    resizeCanvasStageToFit();
     ctxBase.clearRect(0, 0, cw, ch);
     ctxBase.drawImage(img, 0, 0, cw, ch);
     ctxOver.clearRect(0, 0, cw, ch);
@@ -1665,6 +1855,7 @@
     });
 
     setupCanvasInteraction(detections);
+    applyCanvasViewTransform();
   }
 
   function showFailedPreview() {
@@ -1801,6 +1992,7 @@
   function setupCanvasInteraction(detections) {
     if (!canvasOverlay) return;
     canvasOverlay.onpointermove = (e) => {
+      if (canvasView.dragging) return;
       const pt = canvasPoint(e);
       const hit = detections.find(d => isHit(d, pt));
       if (hit) {
@@ -1820,6 +2012,7 @@
       if (canvasTooltip) canvasTooltip.hidden = true;
     };
     canvasOverlay.onclick = (e) => {
+      if (canvasView.suppressClick) return;
       const pt = canvasPoint(e);
       const hit = detections.find(d => isHit(d, pt));
       if (hit) {
@@ -1834,6 +2027,13 @@
   }
 
   function canvasPoint(e) {
+    const transformed = inverseCanvasViewPoint(e.clientX, e.clientY);
+    if (transformed && canvasOverlay) {
+      return {
+        x: transformed.x * (canvasOverlay.width / transformed.width),
+        y: transformed.y * (canvasOverlay.height / transformed.height),
+      };
+    }
     const rect = canvasOverlay.getBoundingClientRect();
     return {
       x: (e.clientX - rect.left) * (canvasOverlay.width / rect.width),
@@ -2165,17 +2365,25 @@
     const [nx1, ny1, nx2, ny2] = bbox;
     const cy = (ny1 + ny2) / 2;
     const cx = (nx1 + nx2) / 2;
+    const bw = Math.max(0, nx2 - nx1);
+    const bh = Math.max(0, ny2 - ny1);
+    const area = bw * bh;
 
-    // テキスト領域（折れ目以外を強く減衰、折れ目は弱く減衰）
-    let inText = false;
     for (const z of DETECT_PARAMS.textZones) {
-      if (cy >= z.y1 && cy <= z.y2) { inText = true; break; }
-    }
-    if (inText) {
-      // 折れ目は構造的なので減衰を弱く（0.7）
-      const factor = (d.type === 'crease') ? 0.7 : 0.5;
-      d.confidence = (d.confidence || 0) * factor;
-      d._mask_applied = (d._mask_applied || []).concat(['text_zone']);
+      const overlap = overlapRatio1D(ny1, ny2, z.y1, z.y2);
+      if (cy >= z.y1 && cy <= z.y2 || overlap >= 0.35) {
+        if (d.type === 'indent') {
+          const areaMm2 = d.metrics && Number.isFinite(d.metrics.area_mm2) ? d.metrics.area_mm2 : 0;
+          const smallTextBlob = areaMm2 < 30 && (area < 0.018 || bh < 0.055);
+          d.confidence = (d.confidence || 0) * (smallTextBlob ? z.strength : 0.9);
+        } else if (d.type === 'crease') {
+          d.confidence = (d.confidence || 0) * (isPrintedRuleLine(d) ? 0.35 : 0.75);
+        } else {
+          d.confidence = (d.confidence || 0) * 0.55;
+        }
+        d._mask_applied = (d._mask_applied || []).concat([z.name]);
+        break;
+      }
     }
 
     // ホログラム領域: Crease 以外を減衰（折れ目は本物の損傷の可能性）
@@ -2188,6 +2396,20 @@
         }
       }
     }
+  }
+
+  function isPrintedRuleLine(d) {
+    if (!d.geom || d.geom.kind !== 'polyline' || !d.geom.points_norm) return false;
+    const [[x1, y1], [x2, y2]] = d.geom.points_norm;
+    const dx = Math.abs(x2 - x1);
+    const dy = Math.abs(y2 - y1);
+    const length = Math.hypot(dx, dy);
+    return length > 0.08 && (dy / (dx || 1e-9)) < 0.16;
+  }
+
+  function overlapRatio1D(a1, a2, b1, b2) {
+    const inter = Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
+    return inter / Math.max(1e-9, a2 - a1);
   }
 
   function bboxNormOf(d) {
@@ -2394,6 +2616,7 @@
     const { top, bottom, left, right } = frame;
     const horizSum = left + right;
     const vertSum = top + bottom;
+    if (horizSum <= 0 || vertSum <= 0) return null;
     const leftPct = (left / horizSum) * 100;
     const rightPct = (right / horizSum) * 100;
     const topPct = (top / vertSum) * 100;
@@ -2421,18 +2644,19 @@
 
     // PSAグレード推定（最も悪い軸を採用）
     const worstDeviation = Math.max(horizDev, vertDev);
-    const worstRatio = 50 + worstDeviation / 2; // dev=10 → 55/45
+    const worstRatio = Math.max(leftPct, rightPct, topPct, bottomPct);
 
     let estimatedGrade;
     if (worstRatio <= 55) estimatedGrade = 'GEM MINT 10';
     else if (worstRatio <= 60) estimatedGrade = 'MINT 9';
     else if (worstRatio <= 65) estimatedGrade = 'NM-MT 8';
     else if (worstRatio <= 70) estimatedGrade = 'NM 7';
-    else if (worstRatio <= 75) estimatedGrade = 'EX-MT 6';
-    else if (worstRatio <= 80) estimatedGrade = 'EX 5';
-    else estimatedGrade = 'VG-EX or below';
+    else if (worstRatio <= 80) estimatedGrade = 'EX-MT 6';
+    else if (worstRatio <= 85) estimatedGrade = 'EX 5/4';
+    else if (worstRatio <= 90) estimatedGrade = 'VG or lower';
+    else estimatedGrade = 'OC';
 
-    const overallScore = Math.max(0, Math.round(100 - worstDeviation * 2));
+    const overallScore = Math.max(0, Math.round(100 - (worstRatio - 50) * 2));
 
     return {
       horizontal,
@@ -2440,6 +2664,7 @@
       estimatedGrade,
       overallScore,
       worstDeviation,
+      worstRatio,
       annotation: {
         outer_rect: frame.outer,
         inner_rect: frame.inner,

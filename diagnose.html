@@ -173,9 +173,20 @@
       <div class="results-grid">
         <div class="result-image">
           <h3>📷 アップロード画像</h3>
+          <div class="canvas-tools" aria-label="アップロード画像の表示操作">
+            <button type="button" class="canvas-tool-btn" id="canvas-zoom-out" title="縮小" aria-label="縮小">−</button>
+            <input type="range" class="canvas-zoom-range" id="canvas-zoom-range" min="25" max="500" step="5" value="100" aria-label="拡大率">
+            <button type="button" class="canvas-tool-btn" id="canvas-zoom-in" title="拡大" aria-label="拡大">＋</button>
+            <button type="button" class="canvas-tool-btn" id="canvas-rotate-left" title="左に90度回転" aria-label="左に90度回転">↺</button>
+            <button type="button" class="canvas-tool-btn" id="canvas-rotate-right" title="右に90度回転" aria-label="右に90度回転">↻</button>
+            <button type="button" class="canvas-tool-btn" id="canvas-reset-view" title="表示をリセット" aria-label="表示をリセット">⟲</button>
+            <span class="canvas-zoom-value" id="canvas-zoom-value">100%</span>
+          </div>
           <div class="canvas-wrapper" id="canvas-wrapper">
-            <canvas id="canvas-base" aria-label="アップロードされたカード画像"></canvas>
-            <canvas id="canvas-overlay" aria-label="検出された損傷のハイライト" role="img"></canvas>
+            <div class="canvas-stage" id="canvas-stage">
+              <canvas id="canvas-base" aria-label="アップロードされたカード画像"></canvas>
+              <canvas id="canvas-overlay" aria-label="検出された損傷のハイライト" role="img"></canvas>
+            </div>
             <div class="canvas-tooltip" id="canvas-tooltip" hidden></div>
           </div>
           <p class="canvas-hint">番号バッジをクリックすると右側の詳細にジャンプします</p>
