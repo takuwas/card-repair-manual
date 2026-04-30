@@ -124,6 +124,8 @@
   const canvasBase         = $('canvas-base');
   const canvasOverlay      = $('canvas-overlay');
   const canvasTooltip      = $('canvas-tooltip');
+  const failedPreview      = $('failed-preview');
+  const failedPreviewCanvas = $('failed-preview-canvas');
   const demoBanner         = $('demo-banner');
   const themeToggle        = $('theme-toggle');
   const cvStatus           = $('cv-status');
@@ -553,6 +555,7 @@
       if (watchdogFired) return;
 
       if (result.error === 'card_not_detected') {
+        showFailedPreview();
         showError({
           code: 'card_not_found',
           message: 'カードが認識できません',
@@ -570,6 +573,7 @@
       currentResult = result;
       showProgress(85, '結果を描画中', 4);
       renderResults(result);
+      hideFailedPreview();
       hideProgress();
       showResults();
       setTimeout(() => {
@@ -1353,6 +1357,7 @@
         too_bright:    '画像が明るすぎます（白飛びの可能性）。',
         low_contrast:  'コントラストが不足しています。背景とのコントラストを確保してください。',
         motion_blur:   '画像がブレている可能性があります。',
+        estimated_boundary: 'カード外周を明確に切り出せなかったため、中央のカード比率から境界を推定しています。',
       }[code]) || code,
     }));
     const noDetectWarn = detections.length === 0 ? [{ code: 'no_detections', message: '損傷は検出されませんでした。' }] : [];
@@ -1662,6 +1667,26 @@
     setupCanvasInteraction(detections);
   }
 
+  function showFailedPreview() {
+    if (!failedPreview || !failedPreviewCanvas || !currentImage) return;
+    const maxW = 1100;
+    const scale = Math.min(1, maxW / currentImage.naturalWidth);
+    const w = Math.max(1, Math.round(currentImage.naturalWidth * scale));
+    const h = Math.max(1, Math.round(currentImage.naturalHeight * scale));
+    failedPreviewCanvas.width = w;
+    failedPreviewCanvas.height = h;
+    failedPreviewCanvas.getContext('2d').drawImage(currentImage, 0, 0, w, h);
+    failedPreview.hidden = false;
+  }
+
+  function hideFailedPreview() {
+    if (failedPreview) failedPreview.hidden = true;
+    if (failedPreviewCanvas) {
+      failedPreviewCanvas.width = 0;
+      failedPreviewCanvas.height = 0;
+    }
+  }
+
   function createImageMapper(img, result) {
     const fallbackQuad = [
       { x: 0, y: 0 },
@@ -1885,6 +1910,7 @@
     analysisProgress.hidden = false;
     if (resultsPanel) resultsPanel.hidden = true;
     if (errorState) errorState.hidden = true;
+    hideFailedPreview();
     if (progressLabel) progressLabel.textContent = label;
     if (progressStep) progressStep.textContent = `ステップ ${step}/4: ${label}`;
     if (progressBarFill) progressBarFill.style.width = pct + '%';
@@ -1895,7 +1921,7 @@
     if (analysisProgress) analysisProgress.hidden = true;
     // ユーザー待機状態を解除（CVステータスバナーをこれ以上勝手に出さない）
     userIsWaiting = false;
-    if (cvStatus && cvStatus.dataset.status === 'ready') cvStatus.hidden = true;
+    if (cvStatus && cvStatus.dataset.status !== 'failed') cvStatus.hidden = true;
   }
   function showResults() { if (resultsPanel) resultsPanel.hidden = false; }
   function hideResults() { if (resultsPanel) resultsPanel.hidden = true; }
@@ -1909,6 +1935,12 @@
     userIsWaiting = false;
     // 失敗ステータス以外のCVバナーは隠す
     if (cvStatus && cvStatus.dataset.status !== 'failed') cvStatus.hidden = true;
+    if (
+      currentImage &&
+      !['invalid_format', 'file_too_large', 'load_failed', 'invalid_input', 'sample_load_failed'].includes(err.code)
+    ) {
+      showFailedPreview();
+    }
     if (!errorState) {
       console.error('[diagnose error]', err);
       alert(`${err.message}\n${err.hint || ''}`);
@@ -1942,7 +1974,10 @@
     }
     errorState.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
-  function hideError() { if (errorState) errorState.hidden = true; }
+  function hideError() {
+    if (errorState) errorState.hidden = true;
+    hideFailedPreview();
+  }
 
   // ============================================================
   // PNG 保存（html2canvas 遅延ロード）

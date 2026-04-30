@@ -151,6 +151,10 @@
       detections = applyNMS(detections, DETECT_PARAMS.nmsIoU).slice(0, 20);
 
       progress(requestId, 86, '結果を統合中', 4);
+      if (r.method === 'center_fallback') {
+        imageQuality.warnings = (imageQuality.warnings || []).concat(['estimated_boundary']);
+      }
+
       return {
         engine: { name: 'opencv-worker', version: '0.3.0' },
         detections,
@@ -158,6 +162,7 @@
         holoInfo,
         centering,
         cardQuad: r.quad || null,
+        boundary: { method: r.method, confidence: r.boundary_confidence },
       };
     } finally {
       try { if (rect) rect.delete(); } catch (_) {}
@@ -196,12 +201,16 @@
       for (let i = 0; i < contours.size(); i++) {
         const contour = contours.get(i);
         const area = cv.contourArea(contour);
-        if (area >= imageArea * 0.08) candidates.push({ contour, area });
+        if (area >= imageArea * 0.025) candidates.push({ contour, area });
         else contour.delete();
       }
       candidates.sort((a, b) => b.area - a.area);
 
-      let cardQuad = null;
+      // 境界の定義:
+      // 物理カードの「外周四辺」をカード境界とする。ポケモンカード標準比率は約 63:88。
+      // アートワーク枠、テキスト枠、スリーブ内側の反射線はカード境界ではないため、
+      // 面積・比率・画像中心からの距離で候補をスコアリングして外周らしいものを選ぶ。
+      let best = null;
       for (const cand of candidates.slice(0, 12)) {
         const peri = cv.arcLength(cand.contour, true);
         for (const eps of [0.015, 0.02, 0.03, 0.045]) {
@@ -213,20 +222,18 @@
               pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
             }
             const sorted = sortQuadCorners(pts);
-            const w = (dist(sorted[0], sorted[1]) + dist(sorted[3], sorted[2])) / 2;
-            const h = (dist(sorted[0], sorted[3]) + dist(sorted[1], sorted[2])) / 2;
-            const ratio = Math.min(w, h) / Math.max(w, h);
-            if (Math.abs(ratio - 0.7159) < 0.18 && Math.min(w, h) > 80) {
-              cardQuad = sorted;
-              approx.delete();
-              break;
-            }
+            best = chooseBetterCardQuad(best, sorted, srcMat.cols, srcMat.rows, 'quad');
           }
           approx.delete();
         }
-        if (cardQuad) break;
+
+        const rotated = rotatedRectToQuad(cv.minAreaRect(cand.contour));
+        best = chooseBetterCardQuad(best, rotated, srcMat.cols, srcMat.rows, 'rotated_rect');
+
+        const br = cv.boundingRect(cand.contour);
+        best = chooseBetterCardQuad(best, rectToCardQuad(br, srcMat.cols, srcMat.rows), srcMat.cols, srcMat.rows, 'bounding_rect');
       }
-      if (!cardQuad) return null;
+      const cardQuad = best ? best.quad : centralCardQuad(srcMat.cols, srcMat.rows);
 
       const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
         cardQuad[0].x, cardQuad[0].y,
@@ -239,11 +246,119 @@
       const rect = new cv.Mat();
       cv.warpPerspective(srcMat, rect, M, new cv.Size(RECT_W, RECT_H));
       srcPts.delete(); dstPts.delete(); M.delete();
-      return { rect, quad: cardQuad };
+      return { rect, quad: cardQuad, method: best ? best.method : 'center_fallback', boundary_confidence: best ? clamp01(best.score / 3.5) : 0.25 };
     } finally {
       candidates.forEach(c => { try { c.contour.delete(); } catch (_) {} });
       gray.delete(); edges.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
     }
+  }
+
+  function chooseBetterCardQuad(current, quad, imageW, imageH, method) {
+    const scored = scoreCardQuad(quad, imageW, imageH, method);
+    if (!scored) return current;
+    if (!current || scored.score > current.score) return scored;
+    return current;
+  }
+
+  function scoreCardQuad(quad, imageW, imageH, method) {
+    if (!quad || quad.length !== 4) return null;
+    const sorted = sortQuadCorners(quad.map(p => ({
+      x: clamp(p.x, 0, imageW - 1),
+      y: clamp(p.y, 0, imageH - 1),
+    })));
+    const topW = dist(sorted[0], sorted[1]);
+    const bottomW = dist(sorted[3], sorted[2]);
+    const leftH = dist(sorted[0], sorted[3]);
+    const rightH = dist(sorted[1], sorted[2]);
+    const w = (topW + bottomW) / 2;
+    const h = (leftH + rightH) / 2;
+    const shortSide = Math.min(w, h);
+    if (shortSide < Math.min(imageW, imageH) * 0.12 || shortSide < 60) return null;
+
+    const area = polygonArea(sorted);
+    const areaRatio = area / (imageW * imageH);
+    if (areaRatio < 0.04 || areaRatio > 0.98) return null;
+
+    const cardRatio = 63 / 88;
+    const ratio = Math.min(w, h) / Math.max(w, h);
+    const ratioPenalty = Math.min(1, Math.abs(ratio - cardRatio) / 0.35);
+    if (ratioPenalty >= 1) return null;
+
+    const cx = sorted.reduce((sum, p) => sum + p.x, 0) / 4;
+    const cy = sorted.reduce((sum, p) => sum + p.y, 0) / 4;
+    const centerDist = Math.hypot((cx - imageW / 2) / imageW, (cy - imageH / 2) / imageH);
+    const methodBonus = method === 'quad' ? 0.35 : method === 'rotated_rect' ? 0.18 : 0.02;
+    const score = areaRatio * 2.4 + (1 - ratioPenalty) * 1.4 + methodBonus - centerDist * 0.8;
+    return { quad: sorted, score, method };
+  }
+
+  function rotatedRectToQuad(rr) {
+    const cx = rr.center.x;
+    const cy = rr.center.y;
+    const w = rr.size.width;
+    const h = rr.size.height;
+    const angle = (rr.angle || 0) * Math.PI / 180;
+    const ux = { x: Math.cos(angle), y: Math.sin(angle) };
+    const uy = { x: -Math.sin(angle), y: Math.cos(angle) };
+    const hw = w / 2;
+    const hh = h / 2;
+    return [
+      { x: cx - ux.x * hw - uy.x * hh, y: cy - ux.y * hw - uy.y * hh },
+      { x: cx + ux.x * hw - uy.x * hh, y: cy + ux.y * hw - uy.y * hh },
+      { x: cx + ux.x * hw + uy.x * hh, y: cy + ux.y * hw + uy.y * hh },
+      { x: cx - ux.x * hw + uy.x * hh, y: cy - ux.y * hw + uy.y * hh },
+    ];
+  }
+
+  function rectToCardQuad(rect, imageW, imageH) {
+    const cardRatio = 63 / 88;
+    let x = rect.x;
+    let y = rect.y;
+    let w = rect.width;
+    let h = rect.height;
+    const ratio = Math.min(w, h) / Math.max(w, h);
+    if (Math.abs(ratio - cardRatio) > 0.18) {
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      if (h >= w) {
+        h = Math.min(h, w / cardRatio);
+        w = Math.min(w, h * cardRatio);
+      } else {
+        w = Math.min(w, h / cardRatio);
+        h = Math.min(h, w * cardRatio);
+      }
+      x = cx - w / 2;
+      y = cy - h / 2;
+    }
+    x = clamp(x, 0, imageW - w);
+    y = clamp(y, 0, imageH - h);
+    return [
+      { x, y },
+      { x: x + w, y },
+      { x: x + w, y: y + h },
+      { x, y: y + h },
+    ];
+  }
+
+  function centralCardQuad(imageW, imageH) {
+    const cardRatio = 63 / 88;
+    const imageRatio = imageW / imageH;
+    let w, h;
+    if (imageRatio >= cardRatio) {
+      h = imageH * 0.92;
+      w = h * cardRatio;
+    } else {
+      w = imageW * 0.92;
+      h = w / cardRatio;
+    }
+    const x = (imageW - w) / 2;
+    const y = (imageH - h) / 2;
+    return [
+      { x, y },
+      { x: x + w, y },
+      { x: x + w, y: y + h },
+      { x, y: y + h },
+    ];
   }
 
   function normalizeIllumination(rectMat) {
@@ -907,6 +1022,14 @@
     return (trimmed.length ? trimmed : sorted)[Math.floor((trimmed.length ? trimmed : sorted).length / 2)];
   }
 
+  function polygonArea(points) {
+    let area = 0;
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      area += (points[j].x + points[i].x) * (points[j].y - points[i].y);
+    }
+    return Math.abs(area / 2);
+  }
+
   function stdOf(values) {
     if (!values || values.length < 2) return null;
     const m = values.reduce((a, b) => a + b, 0) / values.length;
@@ -914,5 +1037,6 @@
   }
 
   function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
   function clamp01(v) { return Math.max(0, Math.min(1, v)); }
 })();
