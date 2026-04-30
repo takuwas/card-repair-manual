@@ -116,7 +116,7 @@
 
       progress(requestId, 50, 'カード境界を検出中', 2);
       const warpResult = safeCall(() => detectWarp(src), 'detectWarp');
-      const r = safeCall(() => rectifyCard(src), 'rectifyCard');
+      const r = safeCall(() => rectifyCardOptimized(src), 'rectifyCardOptimized');
       if (!r) return { error: 'card_not_detected' };
       rect = r.rect;
 
@@ -158,13 +158,13 @@
       }
 
       return {
-        engine: { name: 'opencv-worker', version: '0.3.0' },
+        engine: { name: 'opencv-worker', version: '0.4.0' },
         detections,
         imageQuality,
         holoInfo,
         centering,
         cardQuad: r.quad || null,
-        boundary: { method: r.method, confidence: r.boundary_confidence },
+        boundary: { method: r.method, confidence: r.boundary_confidence, metrics: r.metrics || null },
       };
     } finally {
       try { if (rect) rect.delete(); } catch (_) {}
@@ -182,6 +182,417 @@
       self.postMessage({ type: 'log', level: 'warn', message: `${name}: ${err.message || err}` });
       return null;
     }
+  }
+
+  function rectifyCardOptimized(srcMat) {
+    const gray = new cv.Mat();
+    const blurred = new cv.Mat();
+    const edges = new cv.Mat();
+    const adaptiveEdges = new cv.Mat();
+    const equalized = new cv.Mat();
+    const equalizedEdges = new cv.Mat();
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    const candidates = [];
+    let backgroundMask = null;
+
+    try {
+      cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+
+      cv.Canny(blurred, edges, 45, 140);
+      cv.dilate(edges, edges, kernel, new cv.Point(-1, -1), 2);
+      collectBoundaryCandidatesOptimized(edges, candidates, srcMat, 'canny_quad', 0.018);
+
+      const adaptive = computeAdaptiveCannyThresholds(blurred);
+      cv.Canny(blurred, adaptiveEdges, adaptive.low, adaptive.high);
+      cv.dilate(adaptiveEdges, adaptiveEdges, kernel, new cv.Point(-1, -1), 2);
+      collectBoundaryCandidatesOptimized(adaptiveEdges, candidates, srcMat, 'adaptive_canny_quad', 0.018);
+
+      cv.equalizeHist(blurred, equalized);
+      const eq = computeAdaptiveCannyThresholds(equalized);
+      cv.Canny(equalized, equalizedEdges, Math.max(20, eq.low * 0.85), Math.max(60, eq.high * 0.9));
+      cv.dilate(equalizedEdges, equalizedEdges, kernel, new cv.Point(-1, -1), 1);
+      collectBoundaryCandidatesOptimized(equalizedEdges, candidates, srcMat, 'contrast_quad', 0.018);
+
+      backgroundMask = createBackgroundDifferenceMaskOptimized(srcMat);
+      if (backgroundMask) {
+        collectBoundaryCandidatesOptimized(backgroundMask, candidates, srcMat, 'background_mask_quad', 0.02);
+      }
+
+      const houghFromEdges = buildHoughBoundaryQuadOptimized(edges, srcMat.cols, srcMat.rows);
+      if (houghFromEdges) candidates.push({ quad: houghFromEdges, method: 'hough_lines', area: polygonArea(houghFromEdges) });
+      const houghFromAdaptive = buildHoughBoundaryQuadOptimized(adaptiveEdges, srcMat.cols, srcMat.rows);
+      if (houghFromAdaptive) candidates.push({ quad: houghFromAdaptive, method: 'adaptive_hough_lines', area: polygonArea(houghFromAdaptive) });
+
+      let best = null;
+      const scoringContext = { edgeMat: edges, srcMat };
+      const seen = new Set();
+      candidates
+        .sort((a, b) => (b.area || 0) - (a.area || 0))
+        .slice(0, 80)
+        .forEach((cand) => {
+          const key = candidateKeyOptimized(cand.quad);
+          if (seen.has(key)) return;
+          seen.add(key);
+          best = chooseOptimizedCardQuad(best, cand.quad, srcMat.cols, srcMat.rows, cand.method, scoringContext);
+        });
+
+      if (!best && backgroundMask) {
+        best = chooseOptimizedCardQuad(
+          best,
+          buildMaskBoundingQuadOptimized(backgroundMask, srcMat.cols, srcMat.rows),
+          srcMat.cols,
+          srcMat.rows,
+          'background_mask_relaxed',
+          scoringContext,
+        );
+      }
+
+      const cardQuad = best ? best.quad : centralCardQuad(srcMat.cols, srcMat.rows);
+      const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        cardQuad[0].x, cardQuad[0].y,
+        cardQuad[1].x, cardQuad[1].y,
+        cardQuad[2].x, cardQuad[2].y,
+        cardQuad[3].x, cardQuad[3].y,
+      ]);
+      const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, RECT_W - 1, 0, RECT_W - 1, RECT_H - 1, 0, RECT_H - 1]);
+      const M = cv.getPerspectiveTransform(srcPts, dstPts);
+      const rect = new cv.Mat();
+      cv.warpPerspective(srcMat, rect, M, new cv.Size(RECT_W, RECT_H));
+      srcPts.delete(); dstPts.delete(); M.delete();
+      return {
+        rect,
+        quad: cardQuad,
+        method: best ? best.method : 'center_fallback',
+        boundary_confidence: best ? clamp01(best.score / 5.2) : 0.25,
+        metrics: best ? best.metrics : null,
+      };
+    } finally {
+      if (backgroundMask) backgroundMask.delete();
+      gray.delete(); blurred.delete(); edges.delete(); adaptiveEdges.delete(); equalized.delete(); equalizedEdges.delete(); kernel.delete();
+    }
+  }
+
+  function collectBoundaryCandidatesOptimized(mask, candidates, srcMat, method, areaMinRatio) {
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    try {
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      const imageArea = srcMat.cols * srcMat.rows;
+      for (let i = 0; i < contours.size(); i++) {
+        const contour = contours.get(i);
+        try {
+          const area = cv.contourArea(contour);
+          if (area < imageArea * areaMinRatio) continue;
+          addContourCandidatesOptimized(contour, area, candidates, srcMat, method);
+        } finally {
+          contour.delete();
+        }
+      }
+    } finally {
+      contours.delete(); hierarchy.delete();
+    }
+  }
+
+  function addContourCandidatesOptimized(contour, area, candidates, srcMat, method) {
+    const peri = cv.arcLength(contour, true);
+    for (const eps of [0.012, 0.018, 0.024, 0.035, 0.05]) {
+      const approx = new cv.Mat();
+      try {
+        cv.approxPolyDP(contour, approx, eps * peri, true);
+        if (approx.rows === 4) {
+          const pts = [];
+          for (let j = 0; j < 4; j++) {
+            pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
+          }
+          candidates.push({ quad: sortQuadCorners(pts), method, area });
+        }
+      } finally {
+        approx.delete();
+      }
+    }
+
+    candidates.push({ quad: rotatedRectToQuad(cv.minAreaRect(contour)), method: `${method}_rotated`, area });
+    candidates.push({ quad: rectToCardQuad(cv.boundingRect(contour), srcMat.cols, srcMat.rows), method: `${method}_box`, area });
+  }
+
+  function createBackgroundDifferenceMaskOptimized(srcMat) {
+    if (!srcMat || !srcMat.data || srcMat.channels() < 4) return null;
+    const W = srcMat.cols;
+    const H = srcMat.rows;
+    const patch = Math.max(10, Math.round(Math.min(W, H) * 0.045));
+    const bg = averageCornerColorOptimized(srcMat, patch);
+    const bgLuma = bg.r * 0.299 + bg.g * 0.587 + bg.b * 0.114;
+    const mask = new cv.Mat(H, W, cv.CV_8U);
+    const src = srcMat.data;
+    const dst = mask.data;
+
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const dr = src[i] - bg.r;
+        const dg = src[i + 1] - bg.g;
+        const db = src[i + 2] - bg.b;
+        const colorDist = Math.sqrt(dr * dr + dg * dg + db * db);
+        const luma = src[i] * 0.299 + src[i + 1] * 0.587 + src[i + 2] * 0.114;
+        dst[y * W + x] = (colorDist > 34 || Math.abs(luma - bgLuma) > 24) ? 255 : 0;
+      }
+    }
+
+    const openKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+    const closeKernelSize = Math.max(7, Math.round(Math.min(W, H) * 0.018) | 1);
+    const closeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(closeKernelSize, closeKernelSize));
+    try {
+      cv.morphologyEx(mask, mask, cv.MORPH_OPEN, openKernel);
+      cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, closeKernel);
+    } finally {
+      openKernel.delete(); closeKernel.delete();
+    }
+    return mask;
+  }
+
+  function averageCornerColorOptimized(srcMat, patch) {
+    const W = srcMat.cols;
+    const H = srcMat.rows;
+    const src = srcMat.data;
+    const corners = [[0, 0], [W - patch, 0], [W - patch, H - patch], [0, H - patch]];
+    let r = 0, g = 0, b = 0, count = 0;
+    for (const [sx, sy] of corners) {
+      for (let y = Math.max(0, sy); y < Math.min(H, sy + patch); y++) {
+        for (let x = Math.max(0, sx); x < Math.min(W, sx + patch); x++) {
+          const i = (y * W + x) * 4;
+          r += src[i]; g += src[i + 1]; b += src[i + 2]; count++;
+        }
+      }
+    }
+    return count ? { r: r / count, g: g / count, b: b / count } : { r: 255, g: 255, b: 255 };
+  }
+
+  function buildMaskBoundingQuadOptimized(mask, imageW, imageH) {
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    try {
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      let bestRect = null;
+      let bestArea = 0;
+      for (let i = 0; i < contours.size(); i++) {
+        const contour = contours.get(i);
+        try {
+          const area = cv.contourArea(contour);
+          if (area > bestArea) {
+            bestArea = area;
+            bestRect = cv.boundingRect(contour);
+          }
+        } finally {
+          contour.delete();
+        }
+      }
+      return bestRect ? rectToCardQuad(bestRect, imageW, imageH) : null;
+    } finally {
+      contours.delete(); hierarchy.delete();
+    }
+  }
+
+  function buildHoughBoundaryQuadOptimized(edgeMat, imageW, imageH) {
+    const lines = new cv.Mat();
+    try {
+      const minLine = Math.max(70, Math.round(Math.min(imageW, imageH) * 0.18));
+      cv.HoughLinesP(edgeMat, lines, 1, Math.PI / 180, 60, minLine, Math.round(minLine * 0.12));
+      const horizontal = [];
+      const vertical = [];
+      for (let i = 0; i < lines.rows; i++) {
+        const x1 = lines.data32S[i * 4 + 0];
+        const y1 = lines.data32S[i * 4 + 1];
+        const x2 = lines.data32S[i * 4 + 2];
+        const y2 = lines.data32S[i * 4 + 3];
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const len = Math.hypot(dx, dy);
+        if (len < minLine) continue;
+        const ax = Math.abs(dx) / len;
+        const ay = Math.abs(dy) / len;
+        if (ax > 0.9) horizontal.push({ pos: (y1 + y2) / 2, len });
+        if (ay > 0.9) vertical.push({ pos: (x1 + x2) / 2, len });
+      }
+
+      const top = weightedSidePositionOptimized(horizontal, 0, imageH * 0.55, false);
+      const bottom = weightedSidePositionOptimized(horizontal, imageH * 0.45, imageH, true);
+      const left = weightedSidePositionOptimized(vertical, 0, imageW * 0.55, false);
+      const right = weightedSidePositionOptimized(vertical, imageW * 0.45, imageW, true);
+      if (!Number.isFinite(top) || !Number.isFinite(bottom) || !Number.isFinite(left) || !Number.isFinite(right)) return null;
+      if (bottom - top < imageH * 0.25 || right - left < imageW * 0.18) return null;
+      return [
+        { x: left, y: top },
+        { x: right, y: top },
+        { x: right, y: bottom },
+        { x: left, y: bottom },
+      ];
+    } finally {
+      lines.delete();
+    }
+  }
+
+  function weightedSidePositionOptimized(lines, minPos, maxPos, wantFarSide) {
+    const filtered = lines
+      .filter(l => l.pos >= minPos && l.pos <= maxPos)
+      .sort((a, b) => wantFarSide ? b.pos - a.pos : a.pos - b.pos)
+      .slice(0, 8);
+    if (!filtered.length) return NaN;
+    let sum = 0;
+    let weight = 0;
+    for (const line of filtered) {
+      const w = Math.max(1, line.len);
+      sum += line.pos * w;
+      weight += w;
+    }
+    return sum / weight;
+  }
+
+  function candidateKeyOptimized(quad) {
+    if (!quad || quad.length !== 4) return 'null';
+    return quad.map(p => `${Math.round(p.x / 8)}:${Math.round(p.y / 8)}`).join('|');
+  }
+
+  function chooseOptimizedCardQuad(current, quad, imageW, imageH, method, context) {
+    const scored = scoreOptimizedCardQuad(quad, imageW, imageH, method, context);
+    if (!scored) return current;
+    if (!current || scored.score > current.score) return scored;
+    return current;
+  }
+
+  function scoreOptimizedCardQuad(quad, imageW, imageH, method, context = {}) {
+    if (!quad || quad.length !== 4) return null;
+    const sorted = sortQuadCorners(quad.map(p => ({
+      x: clamp(p.x, 0, imageW - 1),
+      y: clamp(p.y, 0, imageH - 1),
+    })));
+    const topW = dist(sorted[0], sorted[1]);
+    const bottomW = dist(sorted[3], sorted[2]);
+    const leftH = dist(sorted[0], sorted[3]);
+    const rightH = dist(sorted[1], sorted[2]);
+    const w = (topW + bottomW) / 2;
+    const h = (leftH + rightH) / 2;
+    const shortSide = Math.min(w, h);
+    if (shortSide < Math.min(imageW, imageH) * 0.12 || shortSide < 60) return null;
+
+    const area = polygonArea(sorted);
+    const areaRatio = area / (imageW * imageH);
+    if (areaRatio < 0.04 || areaRatio > 0.98) return null;
+
+    const cardRatio = 63 / 88;
+    const ratio = Math.min(w, h) / Math.max(w, h);
+    const ratioPenalty = Math.min(1, Math.abs(ratio - cardRatio) / 0.35);
+    if (ratioPenalty >= 1) return null;
+
+    const cx = sorted.reduce((sum, p) => sum + p.x, 0) / 4;
+    const cy = sorted.reduce((sum, p) => sum + p.y, 0) / 4;
+    const centerDist = Math.hypot((cx - imageW / 2) / imageW, (cy - imageH / 2) / imageH);
+    const edgeSupport = context.edgeMat ? sampleEdgeSupportOptimized(context.edgeMat, sorted) : 0;
+    const contrastSupport = context.srcMat ? sampleBoundaryContrastOptimized(context.srcMat, sorted) : 0;
+    const fill = clamp01(areaRatio / 0.42);
+    const methodBonus = method && method.includes('hough') ? 0.35
+      : method && method.includes('mask') ? 0.28
+      : method && method.includes('quad') ? 0.26
+      : method && method.includes('rotated') ? 0.16
+      : 0.02;
+    const supportScore = edgeSupport * 1.15 + contrastSupport * 0.95;
+    const score = fill * 1.25 + areaRatio * 1.35 + (1 - ratioPenalty) * 1.45 + supportScore + methodBonus - centerDist * 0.65;
+    return {
+      quad: sorted,
+      score,
+      method,
+      metrics: {
+        area_ratio: areaRatio,
+        ratio_penalty: ratioPenalty,
+        edge_support: edgeSupport,
+        contrast_support: contrastSupport,
+        center_distance: centerDist,
+      },
+    };
+  }
+
+  function sampleEdgeSupportOptimized(edgeMat, quad) {
+    let hits = 0;
+    let total = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = quad[i];
+      const b = quad[(i + 1) % 4];
+      const length = Math.max(1, dist(a, b));
+      const samples = Math.max(18, Math.min(80, Math.round(length / 18)));
+      for (let s = 0; s <= samples; s++) {
+        const t = s / samples;
+        const x = a.x + (b.x - a.x) * t;
+        const y = a.y + (b.y - a.y) * t;
+        total++;
+        if (hasEdgeNearOptimized(edgeMat, x, y, 2)) hits++;
+      }
+    }
+    return total ? hits / total : 0;
+  }
+
+  function hasEdgeNearOptimized(edgeMat, x, y, radius) {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    for (let dy = -radius; dy <= radius; dy++) {
+      const yy = yi + dy;
+      if (yy < 0 || yy >= edgeMat.rows) continue;
+      for (let dx = -radius; dx <= radius; dx++) {
+        const xx = xi + dx;
+        if (xx < 0 || xx >= edgeMat.cols) continue;
+        if (edgeMat.ucharAt(yy, xx) > 0) return true;
+      }
+    }
+    return false;
+  }
+
+  function sampleBoundaryContrastOptimized(srcMat, quad) {
+    const center = {
+      x: quad.reduce((sum, p) => sum + p.x, 0) / 4,
+      y: quad.reduce((sum, p) => sum + p.y, 0) / 4,
+    };
+    let total = 0;
+    let count = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = quad[i];
+      const b = quad[(i + 1) % 4];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.max(1, Math.hypot(dx, dy));
+      const normals = [
+        { x: -dy / len, y: dx / len },
+        { x: dy / len, y: -dx / len },
+      ];
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const n = dist({ x: mid.x + normals[0].x * 8, y: mid.y + normals[0].y * 8 }, center) >
+        dist({ x: mid.x + normals[1].x * 8, y: mid.y + normals[1].y * 8 }, center) ? normals[0] : normals[1];
+      const samples = Math.max(14, Math.min(64, Math.round(len / 24)));
+      for (let s = 1; s < samples; s++) {
+        const t = s / samples;
+        const x = a.x + dx * t;
+        const y = a.y + dy * t;
+        const outside = readRgbaOptimized(srcMat, x + n.x * 8, y + n.y * 8);
+        const inside = readRgbaOptimized(srcMat, x - n.x * 8, y - n.y * 8);
+        if (!outside || !inside) continue;
+        total += colorDistanceOptimized(outside, inside);
+        count++;
+      }
+    }
+    return count ? clamp01((total / count) / 82) : 0;
+  }
+
+  function readRgbaOptimized(mat, x, y) {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    if (xi < 0 || xi >= mat.cols || yi < 0 || yi >= mat.rows) return null;
+    const i = (yi * mat.cols + xi) * 4;
+    return [mat.data[i], mat.data[i + 1], mat.data[i + 2]];
+  }
+
+  function colorDistanceOptimized(a, b) {
+    const dr = a[0] - b[0];
+    const dg = a[1] - b[1];
+    const db = a[2] - b[2];
+    return Math.sqrt(dr * dr + dg * dg + db * db);
   }
 
   function rectifyCard(srcMat) {
