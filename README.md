@@ -14,6 +14,7 @@ card-repair-manual/
 ├── diagnose.html      ← 画像診断ツール（β版）のエントリポイント
 ├── diagnose.css       ← 診断ツール専用スタイル
 ├── diagnose.js        ← 診断ツール（OpenCV.jsベースのCV処理）
+├── diagnose-worker.js ← OpenCV.js のロードと画像解析を行う Web Worker
 ├── python/            ← 訓練データ前処理 + モデル学習スクリプト群（詳細は python/README.md）
 ├── README.md          ← このファイル
 └── working/           ← 中間生成物（章別出力、検証レポート 等）
@@ -107,7 +108,7 @@ npx serve .
 ### 概要
 
 - ブラウザ完結型（画像はサーバーへ送信されません）
-- フェーズ1: **ヒューリスティックCV**（OpenCV.js による反り・凹み・汚れ検出）← 現在公開中
+- フェーズ1: **ヒューリスティックCV**（Web Worker 内の OpenCV.js による反り・凹み・汚れ検出）← 現在公開中
 - フェーズ2: **深層学習モデル**（CNN/Transformer による損傷分類）← 訓練中
 
 ### サイトからのアクセス

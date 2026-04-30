@@ -142,6 +142,9 @@
   let cvLoadFailed = false;
   let cvReadyPromise = null;
   let pendingFile = null;         // OpenCV.js ロード前にユーザーがアップロードした場合の保留
+  let diagnoseWorker = null;
+  let workerSeq = 0;
+  const workerPending = new Map();
 
   // ============================================================
   // テーマ（既存サイト script.js と localStorage を共有）
@@ -216,193 +219,74 @@
     }
   }
 
-  // 複数のCDNを順番に試す（最初に成功したものを使う）
-  const OPENCV_CDN_URLS = [
-    'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
-    'https://docs.opencv.org/4.10.0/opencv.js',
-    'https://docs.opencv.org/4.x/opencv.js',
-    'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js'
-  ];
-
-  // ★注意★ この loadScript は OpenCV.js 専用（タイムアウト付き）。
-  // 関数名の衝突を避けるため、PNG保存などの汎用ロード用は loadExternalScript() に分離している。
-  function loadScript(url, timeoutMs = 30000) {
-    return new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.async = true;
-      // crossOrigin を付けない: 単独テストで cv.Mat が 0.9秒で利用可能だったが、
-      // crossOrigin='anonymous' を付けると永久にハングする現象を確認したため。
-      // OpenCV.js (techstark v4.10) は単一ファイル（WASM埋め込み）なので CORS は不要。
-      script.src = url;
-      let done = false;
-      const timer = setTimeout(() => {
-        if (done) return;
-        done = true;
-        script.remove();
-        reject(new Error('timeout'));
-      }, timeoutMs);
-      script.onload = () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        resolve(script);
-      };
-      script.onerror = () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        script.remove();
-        reject(new Error('script error'));
-      };
-      document.head.appendChild(script);
-    });
+  function getDiagnoseWorker() {
+    if (diagnoseWorker) return diagnoseWorker;
+    diagnoseWorker = new Worker('diagnose-worker.js');
+    diagnoseWorker.onmessage = (event) => {
+      const msg = event.data || {};
+      const pending = workerPending.get(msg.requestId);
+      if (msg.type === 'progress') {
+        if (msg.label) setCvStatus('loading', `⏳ ${msg.label}`);
+        if (analysisProgress && !analysisProgress.hidden) showProgress(msg.pct || 20, msg.label || '解析中', msg.step || 2);
+        return;
+      }
+      if (msg.type === 'log') {
+        const level = msg.level === 'warn' ? 'warn' : 'log';
+        console[level]('[diagnose worker]', msg.message);
+        return;
+      }
+      if (!pending) return;
+      if (msg.type === 'ready' || msg.type === 'result') {
+        workerPending.delete(msg.requestId);
+        pending.resolve(msg.result || true);
+      } else if (msg.type === 'error') {
+        workerPending.delete(msg.requestId);
+        pending.reject(new Error(msg.message || 'worker error'));
+      }
+    };
+    diagnoseWorker.onerror = (event) => {
+      const err = new Error(event.message || 'diagnose worker error');
+      workerPending.forEach(p => p.reject(err));
+      workerPending.clear();
+      diagnoseWorker = null;
+      cvReadyPromise = null;
+      cvLoadFailed = true;
+      setCvStatus('failed', '⚠️ 検出エンジンの起動に失敗しました。');
+    };
+    return diagnoseWorker;
   }
 
-  function waitForOpenCVRuntime(timeoutMs) {
+  function postWorker(type, payload = {}, transfer = []) {
+    const worker = getDiagnoseWorker();
+    const requestId = `req-${++workerSeq}`;
     return new Promise((resolve, reject) => {
-      let done = false;
-
-      // 確実なタイムアウト（onRuntimeInitialized コールバック待ちで止まらないように
-      // setTimeout ベースで強制的に reject する）
-      const timer = setTimeout(() => {
-        if (done) return;
-        done = true;
-        reject(new Error('runtime init timeout'));
-      }, timeoutMs);
-
-      function poll() {
-        if (done) return;
-        // 1. 完全に初期化済み？
-        if (window.cv && typeof window.cv.Mat === 'function') {
-          done = true;
-          clearTimeout(timer);
-          resolve(window.cv);
-          return;
-        }
-        // 2. ファストパス: onRuntimeInitialized コールバックも登録しておく
-        //    （コールバックが発火しなくても下のポーリングで救える）
-        if (window.cv && window.cv.onRuntimeInitialized !== undefined && !window.cv._hookedByDiagnose) {
-          window.cv._hookedByDiagnose = true;
-          const prev = window.cv.onRuntimeInitialized;
-          window.cv.onRuntimeInitialized = () => {
-            if (typeof prev === 'function') { try { prev(); } catch (_) {} }
-            // ポーリングがすぐ次の200msで拾うので resolve はそちらに任せる
-          };
-        }
-        // 3. ポーリング継続（onRuntimeInitialized が無音失敗してもこちらで救える）
-        setTimeout(poll, 200);
-      }
-      poll();
+      workerPending.set(requestId, { resolve, reject, type });
+      worker.postMessage({ ...payload, type, requestId }, transfer);
     });
   }
 
   async function waitForOpenCV() {
     if (cvReadyPromise) return cvReadyPromise;
-    cvReadyPromise = new Promise((resolve, reject) => {
-      // 既にロード済みの場合
-      if (window.cv && typeof window.cv.Mat === 'function') {
+    cvReadyPromise = postWorker('load')
+      .then(() => {
         cvReady = true;
-        setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
-        resolve(window.cv);
-        return;
-      }
-
-      // 重要: Emscripten の流儀で、script ロード前に Module を設定する。
-      // onRuntimeInitialized で resolve するのが OpenCV.js の正しい使い方。
-      // ポーリング方式は不要（minimal test では 0.9秒でこのコールバックが発火することを確認済み）。
-      const TOTAL_TIMEOUT = 90000;
-      let done = false;
-      const timer = setTimeout(() => {
-        if (done) return;
-        done = true;
+        cvLoadFailed = false;
+        setCvStatus('ready', '✅ 検出エンジン (OpenCV.js worker) の準備完了');
+        return true;
+      })
+      .catch(err => {
         cvLoadFailed = true;
-        setCvStatus('failed', '⚠️ OpenCV.js のロードがタイムアウトしました。リロードまたはネットワーク確認をお願いします。');
-        reject(new Error('opencv load timeout'));
-      }, TOTAL_TIMEOUT);
-
-      window.Module = window.Module || {};
-      const prevOnRuntime = window.Module.onRuntimeInitialized;
-
-      // 完了判定の共通処理。コールバック・ポーリングどちらでも先勝ちで成功扱い。
-      const markReady = () => {
-        if (done) return;
-        if (!(window.cv && typeof window.cv.Mat === 'function')) return; // まだ未完
-        done = true;
-        clearTimeout(timer);
-        cvReady = true;
-        setCvStatus('ready', '✅ 検出エンジン (OpenCV.js) の準備完了');
-        resolve(window.cv);
-      };
-
-      window.Module.onRuntimeInitialized = () => {
-        if (typeof prevOnRuntime === 'function') { try { prevOnRuntime(); } catch (_) {} }
-        // techstark v4.10 は cv.Mat がここで使えるはず
-        markReady();
-      };
-
-      // バックアップ: 500ms ポーリング (setTimeout チェーン)
-      // setInterval だと WASM 初期化中に複数回キューされてクラッシュ要因になる場合があるため
-      function poll() {
-        if (done) return;
-        if (window.cv && typeof window.cv.Mat === 'function') {
-          markReady();
-          return;
-        }
-        setTimeout(poll, 500);
-      }
-      // 最初のポーリングは少し遅らせて WASM 初期化を妨げない
-      setTimeout(poll, 1000);
-
-      // CDN を順に試す（ダウンロード失敗時のみ次へ）
-      let cdnIdx = 0;
-      function tryNextCDN() {
-        if (done) return;
-        if (cdnIdx >= OPENCV_CDN_URLS.length) {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          cvLoadFailed = true;
-          setCvStatus('failed', '⚠️ OpenCV.js のダウンロードに失敗しました（全CDN応答なし）。');
-          reject(new Error('all CDNs failed'));
-          return;
-        }
-        const url = OPENCV_CDN_URLS[cdnIdx];
-        const host = new URL(url).hostname;
-        setCvStatus('loading', `⏳ 検出エンジンを読み込み中… (${host}、初回は10〜30秒)`);
-        loadScript(url, 15000)
-          .then(() => {
-            // ダウンロード成功。あとは onRuntimeInitialized を待つ（上で登録済み）
-            // setCvStatus はそのままにしておく（ユーザーには「読み込み中」と見える）
-            console.log(`[diagnose] script loaded from ${host}, waiting for runtime init...`);
-          })
-          .catch((err) => {
-            console.warn(`[diagnose] OpenCV CDN failed: ${host} (${err.message})`);
-            cdnIdx++;
-            tryNextCDN();
-          });
-      }
-      tryNextCDN();
-    });
-    cvReadyPromise.catch(() => {}); // Unhandled rejection 抑止
+        cvReadyPromise = null;
+        setCvStatus('failed', '⚠️ OpenCV.js worker の読み込みに失敗しました。');
+        throw err;
+      });
+    cvReadyPromise.catch(() => {});
     return cvReadyPromise;
   }
-  // OpenCV.js はサイズが大きく（〜10MB）WASM 初期化でメインスレッドが一瞬重くなる。
-  // ・preload (HTMLヘッダ) でダウンロードはページレンダリングと並行で進む
-  // ・実行（コンパイル＋初期化）は DOM ready 後 500ms 遅延で開始
-  //   → 初期表示はブロックしない
-  // ・ユーザーがそれより早くアップロードした場合は handleFile() 内で同じ Promise を待機する
-  // 注意: requestIdleCallback は環境によって発火しないことがあるため使用しない。
-  function startOpenCVPrewarm() {
-    setTimeout(() => {
-      console.log('[diagnose] starting OpenCV prewarm');
-      waitForOpenCV().catch(err => console.warn('[diagnose] OpenCV prewarm:', err.message));
-    }, 500);
-  }
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    startOpenCVPrewarm();
-  } else {
-    document.addEventListener('DOMContentLoaded', startOpenCVPrewarm, { once: true });
-  }
+
+  // OpenCV.js は worker 内で実行する。精度優先の OpenCV 処理を維持しつつ、
+  // UI スレッドの停止を避けるため、ページ本体では cv を直接初期化しない。
+  console.log('[diagnose] OpenCV will run in a worker on first analysis.');
 
   // ============================================================
   // アップロード関連
@@ -715,10 +599,9 @@
    * メインエントリ: 画像から損傷を検出して結果 JSON を返す
    */
   async function analyzeCardFromImage(img, file) {
-    const cv = window.cv;
-    // 入力を canvas に描く（cv.imread 用）
+    // 入力を canvas に描き、OpenCV worker へ転送する。
     const inputCanvas = document.createElement('canvas');
-    // 大きすぎる画像は最大辺 1600px に縮小（処理速度のため）
+    // 大きすぎる画像は最大辺 1600px に縮小（精度と速度のバランス）。
     const MAX_DIM = 1600;
     let iw = img.naturalWidth, ih = img.naturalHeight;
     const maxSide = Math.max(iw, ih);
@@ -732,116 +615,57 @@
     inputCanvas.height = ih;
     inputCanvas.getContext('2d').drawImage(img, 0, 0, iw, ih);
 
-    showProgress(45, 'カード境界を検出中', 2);
-    await new Promise(r => setTimeout(r, 30)); // UI更新を許す
+    showProgress(42, 'OpenCV worker へ画像を転送中', 2);
+    await new Promise(r => setTimeout(r, 20));
 
-    let src = null, rect = null;
-    try {
-      src = cv.imread(inputCanvas);
+    const imageData = inputCanvas.getContext('2d').getImageData(0, 0, iw, ih);
+    const workerResult = await postWorker('analyze', {
+      width: iw,
+      height: ih,
+      buffer: imageData.data.buffer,
+    }, [imageData.data.buffer]);
 
-      // 撮影品質の判定（正面化前の元画像で）
-      const imageQuality = safeCall(() => assessImageQuality(src), 'assessImageQuality') || { warnings: [], metrics: {} };
+    if (!workerResult || workerResult.error) return workerResult || { error: 'internal_error' };
 
-      // 反り検出（正面化前の画像で行う）
-      const warpResult = safeCall(() => detectWarp(src), 'detectWarp');
+    const cardQuadOriginal = Array.isArray(workerResult.cardQuad)
+      ? workerResult.cardQuad.map(p => ({ x: p.x / scale, y: p.y / scale }))
+      : null;
+    const imageQuality = workerResult.imageQuality || { warnings: [], metrics: {} };
+    const holoInfo = workerResult.holoInfo || { is_holographic: false };
+    const centering = workerResult.centering || null;
+    const damages = Array.isArray(workerResult.detections) ? workerResult.detections : [];
 
-      // カード矩形検出 → 正面化
-      const r = safeCall(() => rectifyCard(src), 'rectifyCard');
-      if (!r) {
-        src.delete();
-        return { error: 'card_not_detected' };
+    // ID 付与・ラベル整形
+    damages.forEach((d, i) => {
+      d.id = `d${i + 1}`;
+      const meta = DAMAGE_TYPES[d.type] || { jp: d.type, color: '#888' };
+      d.type_label_jp = meta.jp;
+      d.severity_label_jp = severityLabel(d.severity);
+      d.highlight_color = meta.color;
+      d.label_short = `${meta.jp} (${d.severity_label_jp})`;
+      const key = `${d.type}.${d.severity}`;
+      d.repair_methods = REPAIR_METHOD_MAP[key]
+        || REPAIR_METHOD_MAP[`${d.type}.moderate`]
+        || REPAIR_METHOD_MAP[`${d.type}.light`]
+        || [{ name: 'マニュアル本体で確認', chapter: '#chapter-1', summary: 'クイック診断チャートで詳細を確認', priority: 1 }];
+      d.explanation = buildExplanation(d);
+      if (d.geom && d.geom.kind === 'bbox' && d.geom.norm) {
+        const [nx1, ny1, nx2, ny2] = d.geom.norm;
+        d.bbox_pixel = [nx1 * RECT_W, ny1 * RECT_H, nx2 * RECT_W, ny2 * RECT_H];
+      } else if (d.geom && d.geom.kind === 'polyline' && d.geom.points_norm) {
+        const xs = d.geom.points_norm.map(p => p[0] * RECT_W);
+        const ys = d.geom.points_norm.map(p => p[1] * RECT_H);
+        d.bbox_pixel = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
       }
-      rect = r.rect;
+    });
 
-      showProgress(55, '照明を正規化中', 2);
-      await new Promise(r2 => setTimeout(r2, 30));
-      // 照明正規化
-      safeCall(() => normalizeIllumination(rect), 'normalizeIllumination');
-
-      // ホログラム検出（中央のアートワーク領域で）
-      const holoInfo = safeCall(() => detectHolographic(rect), 'detectHolographic') || { is_holographic: false };
-
-      // センタリング採点（内枠検出 → 比率計算）
-      showProgress(58, 'センタリングを採点中', 2);
-      await new Promise(r2 => setTimeout(r2, 20));
-      const innerFrame = safeCall(() => detectInnerFrame(rect), 'detectInnerFrame');
-      const centering = innerFrame ? safeCall(() => computeCentering(innerFrame), 'computeCentering') : null;
-
-      // 各損傷を検出
-      showProgress(62, '折れ目を検出中', 3);
-      await new Promise(r2 => setTimeout(r2, 20));
-      const creases = safeCall(() => detectCreases(rect), 'detectCreases') || [];
-
-      showProgress(70, '凹みを検出中', 3);
-      await new Promise(r2 => setTimeout(r2, 20));
-      const indents = safeCall(() => detectIndents(rect), 'detectIndents') || [];
-
-      showProgress(75, '角の損傷を検出中', 3);
-      await new Promise(r2 => setTimeout(r2, 20));
-      const corners = safeCall(() => detectCornerDamage(rect), 'detectCornerDamage') || [];
-
-      showProgress(80, 'シミを検出中', 3);
-      await new Promise(r2 => setTimeout(r2, 20));
-      const stains = safeCall(() => detectStains(rect), 'detectStains') || [];
-
-      let damages = [...creases, ...indents, ...corners, ...stains];
-      if (warpResult && warpResult.severity) damages.push(warpResult);
-
-      // === 信頼度ポストプロセス（精度向上のキモ） ===
-      // 1) レイアウトマスクで信頼度を減衰（テキスト/ホロ領域の誤検出抑制）
-      damages.forEach(d => applyLayoutMask(d, holoInfo));
-      // 2) 撮影品質警告に応じた信頼度補正
-      if (imageQuality.warnings && imageQuality.warnings.includes('motion_blur')) {
-        damages.forEach(d => { d.confidence = (d.confidence || 0) * 0.8; });
-      }
-      if (imageQuality.warnings && imageQuality.warnings.includes('low_contrast')) {
-        damages.forEach(d => { d.confidence = (d.confidence || 0) * 0.9; });
-      }
-      // 3) 信頼度フロア未満は棄却
-      damages = damages.filter(d => (d.confidence || 0) >= DETECT_PARAMS.confidenceFloor);
-      // 4) NMS（同タイプ内の重複統合）
-      damages = applyNMS(damages, DETECT_PARAMS.nmsIoU);
-
-      // ID 付与・ラベル整形
-      damages.forEach((d, i) => {
-        d.id = `d${i + 1}`;
-        const meta = DAMAGE_TYPES[d.type] || { jp: d.type, color: '#888' };
-        d.type_label_jp = meta.jp;
-        d.severity_label_jp = severityLabel(d.severity);
-        d.highlight_color = meta.color;
-        d.label_short = `${meta.jp} (${d.severity_label_jp})`;
-        // 推奨手法
-        const key = `${d.type}.${d.severity}`;
-        const methods = REPAIR_METHOD_MAP[key]
-                     || REPAIR_METHOD_MAP[`${d.type}.moderate`]
-                     || REPAIR_METHOD_MAP[`${d.type}.light`]
-                     || [{ name: 'マニュアル本体で確認', chapter: '#chapter-1', summary: 'クイック診断チャートで詳細を確認', priority: 1 }];
-        d.repair_methods = methods;
-        // 説明文
-        d.explanation = buildExplanation(d);
-        // ピクセル座標の bbox（描画用）— 正面化後の rect 座標系を保持
-        if (d.geom && d.geom.kind === 'bbox' && d.geom.norm) {
-          const [nx1, ny1, nx2, ny2] = d.geom.norm;
-          d.bbox_pixel = [nx1 * RECT_W, ny1 * RECT_H, nx2 * RECT_W, ny2 * RECT_H];
-        } else if (d.geom && d.geom.kind === 'polyline' && d.geom.points_norm) {
-          const xs = d.geom.points_norm.map(p => p[0] * RECT_W);
-          const ys = d.geom.points_norm.map(p => p[1] * RECT_H);
-          d.bbox_pixel = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
-        }
-      });
-
-      // 後始末
-      src.delete(); rect.delete();
-      src = null; rect = null;
-
-      // 結果 JSON 構築（拡張: image quality / holo / centering）
-      return buildResultJSON(img, file, damages, { imageQuality, holoInfo, centering });
-    } catch (err) {
-      // エラー時はマット解放
-      try { if (src) src.delete(); } catch (_) {}
-      try { if (rect) rect.delete(); } catch (_) {}
-      throw err;
-    }
+    return buildResultJSON(img, file, damages, {
+      imageQuality,
+      holoInfo,
+      centering,
+      cardQuad: cardQuadOriginal,
+      engine: workerResult.engine,
+    });
   }
 
   function safeCall(fn, name) {
@@ -924,6 +748,7 @@
       approx.delete();
     }
 
+    candidates.forEach(c => { try { c.contour.delete(); } catch (_) {} });
     gray.delete(); edges.delete(); kernel.delete();
     hierarchy.delete(); contours.delete();
 
@@ -975,6 +800,7 @@
     cv.cvtColor(lab, lab, cv.COLOR_Lab2RGB);
     cv.cvtColor(lab, rectMat, cv.COLOR_RGB2RGBA);
 
+    L.delete();
     channels.delete(); lab.delete(); clahe.delete();
     return rectMat;
   }
@@ -1118,6 +944,7 @@
   }
 
   function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
   // マルチ特徴信頼度: 1つでも極端に低ければ棄却、それ以外は重み付き平均
   function combineConfidences(features, weights) {
@@ -1280,6 +1107,7 @@
       });
     }
 
+    L.delete();
     channels.delete(); lab.delete(); Lf.delete(); bg.delete();
     diff.delete(); mask0.delete(); dark.delete(); k.delete();
     stats.delete(); centroids.delete(); labels.delete();
@@ -1379,8 +1207,9 @@
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const area = cv.contourArea(c);
-      if (area < 50) continue;
+      if (area < 50) { c.delete(); continue; }
       const r = cv.boundingRect(c);
+      c.delete();
       const areaMm2 = area * PX_TO_MM * PX_TO_MM;
 
       let severity = 'light';
@@ -1413,6 +1242,7 @@
       });
     }
 
+    S.delete();
     ch.delete(); hsv.delete();
     lower.delete(); upper.delete(); mask.delete();
     Sf.delete(); dullMask.delete(); combined.delete();
@@ -1436,7 +1266,9 @@
 
     let maxArea = 0, idx = -1;
     for (let i = 0; i < contours.size(); i++) {
-      const a = cv.contourArea(contours.get(i));
+      const contour = contours.get(i);
+      const a = cv.contourArea(contour);
+      contour.delete();
       if (a > maxArea) { maxArea = a; idx = i; }
     }
     if (idx < 0) {
@@ -1469,6 +1301,7 @@
     else if (warpMm >= 0.5) severity = 'moderate';
     else if (warpMm >= 0.2) severity = 'light';
 
+    cnt.delete();
     approx.delete();
     gray.delete(); edges.delete(); contours.delete(); hier.delete();
 
@@ -1494,6 +1327,19 @@
     const imageQuality = extras.imageQuality || { warnings: [], metrics: {} };
     const holoInfo = extras.holoInfo || { is_holographic: false };
     const centering = extras.centering || null;
+    const engineInfo = extras.engine || { name: 'opencv-worker', version: '0.3.0' };
+    const cardQuad = Array.isArray(extras.cardQuad) && extras.cardQuad.length === 4
+      ? extras.cardQuad.map(p => ({
+          x: clamp(p.x, 0, img.naturalWidth),
+          y: clamp(p.y, 0, img.naturalHeight),
+        }))
+      : null;
+    const cardBBox = cardQuad ? {
+      x: Math.min(...cardQuad.map(p => p.x)),
+      y: Math.min(...cardQuad.map(p => p.y)),
+      w: Math.max(...cardQuad.map(p => p.x)) - Math.min(...cardQuad.map(p => p.x)),
+      h: Math.max(...cardQuad.map(p => p.y)) - Math.min(...cardQuad.map(p => p.y)),
+    } : null;
 
     const order = { mild: 0, light: 1, moderate: 2, severe: 3, critical: 4 };
     const highest = detections.reduce((acc, d) => order[d.severity] > order[acc] ? d.severity : acc, 'mild');
@@ -1513,12 +1359,13 @@
 
     return {
       schema_version: '1.1',
-      engine: { name: 'heuristic-cv', version: '0.2.0', is_demo: true, model_loaded_at: new Date().toISOString() },
+      engine: { name: engineInfo.name || 'opencv-worker', version: engineInfo.version || '0.3.0', is_demo: true, model_loaded_at: new Date().toISOString() },
       diagnosed_at: new Date().toISOString(),
       image: {
         filename: file.name, mime: file.type,
         width: img.naturalWidth, height: img.naturalHeight,
-        card_bbox: null, card_corners: null,
+        card_bbox: cardBBox,
+        card_corners: cardQuad,
         orientation: img.naturalWidth > img.naturalHeight ? 'landscape' : 'portrait',
         side: 'front',
         quality: {
@@ -1801,57 +1648,101 @@
     ctxBase.drawImage(img, 0, 0, cw, ch);
     ctxOver.clearRect(0, 0, cw, ch);
 
-    // 検出結果は 750x1050 の正面化座標系 → 元画像座標系へは厳密には逆変換が必要だが
-    // PoC では正面化矩形を元画像中央に等倍マッピングするのが視覚的に分かりやすいため、
-    // 元画像全体に対する相対比で配置する（簡易マッピング）
-    // → bbox_pixel は rect 座標系 (RECT_W x RECT_H)。元画像サイズへスケール
-    const scaleX = cw / RECT_W;
-    const scaleY = ch / RECT_H;
+    const mapper = createImageMapper(img, currentResult);
 
     // センタリングオーバーレイを先に描画（損傷バッジが上に来るように）
     if (centering && centering.available && currentCenteringOverlayEnabled) {
-      drawCenteringOverlay(canvasOverlay, centering, scaleX, scaleY);
+      drawCenteringOverlay(canvasOverlay, centering, mapper);
     }
 
     detections.forEach((d, i) => {
-      drawDetectionOnImage(ctxOver, d, i + 1, scaleX, scaleY);
+      drawDetectionOnImage(ctxOver, d, i + 1, mapper);
     });
 
-    setupCanvasInteraction(detections, scaleX, scaleY);
+    setupCanvasInteraction(detections);
   }
 
-  function drawDetectionOnImage(ctx, d, num, sx, sy) {
+  function createImageMapper(img, result) {
+    const fallbackQuad = [
+      { x: 0, y: 0 },
+      { x: img.naturalWidth, y: 0 },
+      { x: img.naturalWidth, y: img.naturalHeight },
+      { x: 0, y: img.naturalHeight },
+    ];
+    const corners = result && result.image && Array.isArray(result.image.card_corners)
+      ? result.image.card_corners
+      : null;
+    const quad = corners && corners.length === 4
+      ? corners.map(p => ({ x: Number(p.x) || 0, y: Number(p.y) || 0 }))
+      : fallbackQuad;
+    return {
+      quad,
+      pointNorm(nx, ny) {
+        return mapQuadPoint(quad, clamp01(nx), clamp01(ny));
+      },
+      pointRect(x, y) {
+        return mapQuadPoint(quad, clamp01(x / RECT_W), clamp01(y / RECT_H));
+      },
+    };
+  }
+
+  function mapQuadPoint(quad, u, v) {
+    const tl = quad[0], tr = quad[1], br = quad[2], bl = quad[3];
+    const top = {
+      x: tl.x + (tr.x - tl.x) * u,
+      y: tl.y + (tr.y - tl.y) * u,
+    };
+    const bottom = {
+      x: bl.x + (br.x - bl.x) * u,
+      y: bl.y + (br.y - bl.y) * u,
+    };
+    return {
+      x: top.x + (bottom.x - top.x) * v,
+      y: top.y + (bottom.y - top.y) * v,
+    };
+  }
+
+  function drawDetectionOnImage(ctx, d, num, mapper) {
     const color = d.highlight_color || (DAMAGE_TYPES[d.type] || {}).color || '#ff5252';
     ctx.save();
     ctx.strokeStyle = color;
     ctx.fillStyle = color + '33';
     ctx.lineWidth = Math.max(3, ctx.canvas.width / 350);
 
+    d._hitPoly = null;
+    d._hitSegments = null;
+
     let bx = 0, by = 0;
     if (d.geom && d.geom.kind === 'polyline' && d.geom.points_norm) {
+      const pts = d.geom.points_norm.map(p => mapper.pointNorm(p[0], p[1]));
       ctx.beginPath();
-      d.geom.points_norm.forEach((p, i) => {
-        const x = p[0] * RECT_W * sx;
-        const y = p[1] * RECT_H * sy;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-        if (i === 0) { bx = x; by = y; }
+      pts.forEach((p, i) => {
+        if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
       });
       ctx.stroke();
+      if (pts[0]) { bx = pts[0].x; by = pts[0].y; }
+      d._hitSegments = pts.length >= 2 ? [[pts[0], pts[pts.length - 1], Math.max(12, ctx.lineWidth * 4)]] : null;
     } else if (d.geom && d.geom.kind === 'bbox' && d.geom.norm) {
       const [nx1, ny1, nx2, ny2] = d.geom.norm;
-      const x1 = nx1 * RECT_W * sx;
-      const y1 = ny1 * RECT_H * sy;
-      const w = (nx2 - nx1) * RECT_W * sx;
-      const h = (ny2 - ny1) * RECT_H * sy;
-      ctx.fillRect(x1, y1, w, h);
-      ctx.strokeRect(x1, y1, w, h);
-      bx = x1; by = y1;
+      const poly = [
+        mapper.pointNorm(nx1, ny1),
+        mapper.pointNorm(nx2, ny1),
+        mapper.pointNorm(nx2, ny2),
+        mapper.pointNorm(nx1, ny2),
+      ];
+      drawPolygonPath(ctx, poly);
+      ctx.fill();
+      ctx.stroke();
+      d._hitPoly = poly;
+      bx = poly[0].x; by = poly[0].y;
     } else if (d.geom && d.geom.kind === 'card_global') {
       // カード全体: 外枠を破線で
       ctx.setLineDash([10, 6]);
-      ctx.strokeRect(8, 8, ctx.canvas.width - 16, ctx.canvas.height - 16);
+      drawPolygonPath(ctx, mapper.quad);
+      ctx.stroke();
       ctx.setLineDash([]);
-      bx = 30; by = 30;
+      d._hitPoly = mapper.quad;
+      bx = mapper.quad[0].x + 30; by = mapper.quad[0].y + 30;
     }
 
     // 番号バッジ
@@ -1872,7 +1763,17 @@
     ctx.restore();
   }
 
-  function setupCanvasInteraction(detections, sx, sy) {
+  function drawPolygonPath(ctx, points) {
+    if (!points || !points.length) return;
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    });
+    ctx.closePath();
+  }
+
+  function setupCanvasInteraction(detections) {
     if (!canvasOverlay) return;
     canvasOverlay.onpointermove = (e) => {
       const pt = canvasPoint(e);
@@ -1922,15 +1823,32 @@
       if (Math.hypot(pt.x - bx, pt.y - by) < br * 1.6) return true;
     }
     // bbox ヒット
-    if (d.geom && d.geom.kind === 'bbox' && d.geom.norm) {
-      const [nx1, ny1, nx2, ny2] = d.geom.norm;
-      const x1 = nx1 * RECT_W * (canvasOverlay.width / RECT_W);
-      const y1 = ny1 * RECT_H * (canvasOverlay.height / RECT_H);
-      const x2 = nx2 * RECT_W * (canvasOverlay.width / RECT_W);
-      const y2 = ny2 * RECT_H * (canvasOverlay.height / RECT_H);
-      return pt.x >= x1 && pt.x <= x2 && pt.y >= y1 && pt.y <= y2;
+    if (d._hitPoly && pointInPolygon(pt, d._hitPoly)) return true;
+    if (d._hitSegments) {
+      return d._hitSegments.some(([a, b, threshold]) => distancePointToSegment(pt, a, b) <= threshold);
     }
     return false;
+  }
+
+  function pointInPolygon(pt, polygon) {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i].x, yi = polygon[i].y;
+      const xj = polygon[j].x, yj = polygon[j].y;
+      const intersects = ((yi > pt.y) !== (yj > pt.y))
+        && (pt.x < (xj - xi) * (pt.y - yi) / ((yj - yi) || 1e-9) + xi);
+      if (intersects) inside = !inside;
+    }
+    return inside;
+  }
+
+  function distancePointToSegment(pt, a, b) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Math.hypot(pt.x - a.x, pt.y - a.y);
+    const t = clamp(((pt.x - a.x) * dx + (pt.y - a.y) * dy) / len2, 0, 1);
+    return Math.hypot(pt.x - (a.x + t * dx), pt.y - (a.y + t * dy));
   }
 
   function highlightOnCanvas(detId) {
@@ -1939,19 +1857,19 @@
     if (!d) return;
     const ctx = canvasOverlay.getContext('2d');
     const cw = canvasOverlay.width, ch = canvasOverlay.height;
-    const sx = cw / RECT_W, sy = ch / RECT_H;
+    const mapper = createImageMapper(currentImage, currentResult);
     const centering = currentResult.card && currentResult.card.centering;
     let pulses = 0;
     const id = setInterval(() => {
       ctx.clearRect(0, 0, cw, ch);
       // センタリングオーバーレイを再描画
       if (centering && centering.available && currentCenteringOverlayEnabled) {
-        drawCenteringOverlay(canvasOverlay, centering, sx, sy);
+        drawCenteringOverlay(canvasOverlay, centering, mapper);
       }
       currentResult.detections.forEach((dd, i) => {
         const isTarget = dd.id === detId;
         ctx.globalAlpha = isTarget ? (pulses % 2 === 0 ? 1 : 0.45) : 0.6;
-        drawDetectionOnImage(ctx, dd, i + 1, sx, sy);
+        drawDetectionOnImage(ctx, dd, i + 1, mapper);
       });
       ctx.globalAlpha = 1;
       pulses++;
@@ -2191,6 +2109,7 @@
     // 0.45以上ならホログラムカードと推定
     const is_holographic = score >= 0.45;
 
+    Hch.delete(); Sch.delete();
     ch.delete(); hsv.delete(); roi.delete();
     sMean.delete(); sStd.delete();
 
@@ -2498,10 +2417,9 @@
    * Canvas にセンタリングオーバーレイを描画
    * @param {HTMLCanvasElement} canvas - canvasOverlay
    * @param {object} centering - JSON.card.centering
-   * @param {number} sx - rect→canvas スケール
-   * @param {number} sy
+   * @param {{pointRect:function}} mapper - 正面化座標から元画像キャンバスへのマッパー
    */
-  function drawCenteringOverlay(canvas, centering, sx, sy) {
+  function drawCenteringOverlay(canvas, centering, mapper) {
     if (!canvas || !centering || !centering.available) return;
     const ctx = canvas.getContext('2d');
     const ann = centering.annotation;
@@ -2509,32 +2427,50 @@
 
     const [ox1, oy1, ox2, oy2] = ann.outer_rect;
     const [ix1, iy1, ix2, iy2] = ann.inner_rect;
-    const Ox1 = ox1 * sx, Oy1 = oy1 * sy, Ox2 = ox2 * sx, Oy2 = oy2 * sy;
-    const Ix1 = ix1 * sx, Iy1 = iy1 * sy, Ix2 = ix2 * sx, Iy2 = iy2 * sy;
+    const outer = [
+      mapper.pointRect(ox1, oy1),
+      mapper.pointRect(ox2, oy1),
+      mapper.pointRect(ox2, oy2),
+      mapper.pointRect(ox1, oy2),
+    ];
+    const inner = [
+      mapper.pointRect(ix1, iy1),
+      mapper.pointRect(ix2, iy1),
+      mapper.pointRect(ix2, iy2),
+      mapper.pointRect(ix1, iy2),
+    ];
 
     ctx.save();
     // 外枠（緑）
     ctx.strokeStyle = '#22c55e';
     ctx.lineWidth = Math.max(2, canvas.width / 400);
     ctx.setLineDash([]);
-    ctx.strokeRect(Ox1, Oy1, Ox2 - Ox1, Oy2 - Oy1);
+    drawPolygonPath(ctx, outer);
+    ctx.stroke();
 
     // 内枠（青）
     ctx.strokeStyle = '#3b82f6';
     ctx.setLineDash([8, 4]);
-    ctx.strokeRect(Ix1, Iy1, Ix2 - Ix1, Iy2 - Iy1);
+    drawPolygonPath(ctx, inner);
+    ctx.stroke();
     ctx.setLineDash([]);
 
     // 4辺の矢印（枠幅を可視化）
     ctx.strokeStyle = '#fbbf24';
     ctx.fillStyle = '#fbbf24';
     ctx.lineWidth = Math.max(1.5, canvas.width / 600);
-    const cxV = (Ox1 + Ox2) / 2;
-    const cyH = (Oy1 + Oy2) / 2;
-    drawArrow(ctx, cxV, Oy1, cxV, Iy1);   // 上辺
-    drawArrow(ctx, cxV, Oy2, cxV, Iy2);   // 下辺
-    drawArrow(ctx, Ox1, cyH, Ix1, cyH);   // 左辺
-    drawArrow(ctx, Ox2, cyH, Ix2, cyH);   // 右辺
+    const topOuter = mapper.pointRect((ox1 + ox2) / 2, oy1);
+    const topInner = mapper.pointRect((ix1 + ix2) / 2, iy1);
+    const bottomOuter = mapper.pointRect((ox1 + ox2) / 2, oy2);
+    const bottomInner = mapper.pointRect((ix1 + ix2) / 2, iy2);
+    const leftOuter = mapper.pointRect(ox1, (oy1 + oy2) / 2);
+    const leftInner = mapper.pointRect(ix1, (iy1 + iy2) / 2);
+    const rightOuter = mapper.pointRect(ox2, (oy1 + oy2) / 2);
+    const rightInner = mapper.pointRect(ix2, (iy1 + iy2) / 2);
+    drawArrow(ctx, topOuter.x, topOuter.y, topInner.x, topInner.y);
+    drawArrow(ctx, bottomOuter.x, bottomOuter.y, bottomInner.x, bottomInner.y);
+    drawArrow(ctx, leftOuter.x, leftOuter.y, leftInner.x, leftInner.y);
+    drawArrow(ctx, rightOuter.x, rightOuter.y, rightInner.x, rightInner.y);
 
     // テキスト: 比率ラベル
     const fontSize = Math.max(14, canvas.width / 60);
@@ -2542,8 +2478,9 @@
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const label = `${centering.horizontal.ratio_label} ・ ${centering.vertical.ratio_label}`;
-    const tx = (Ix1 + Ix2) / 2;
-    const ty = (Iy1 + Iy2) / 2;
+    const center = mapper.pointRect((ix1 + ix2) / 2, (iy1 + iy2) / 2);
+    const tx = center.x;
+    const ty = center.y;
     // 背景
     const metrics = ctx.measureText(label);
     const padX = 10, padY = 6;

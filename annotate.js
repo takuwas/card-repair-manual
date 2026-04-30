@@ -2086,7 +2086,7 @@ names: [${names}]
   // ダークモード (既存サイトと連動)
   // ============================================================
   function initTheme() {
-    const stored = localStorage.getItem('theme');
+    const stored = localStorage.getItem('cardrepair-theme') || localStorage.getItem('theme');
     const theme = stored || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     document.documentElement.setAttribute('data-theme', theme);
     updateThemeBtn(theme);
@@ -2094,7 +2094,7 @@ names: [${names}]
       const cur = document.documentElement.getAttribute('data-theme') || 'light';
       const next = cur === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
-      localStorage.setItem('theme', next);
+      localStorage.setItem('cardrepair-theme', next);
       updateThemeBtn(next);
     });
   }
