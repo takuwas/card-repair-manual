@@ -79,7 +79,7 @@
   const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
   const RECT_W = 750, RECT_H = 1050; // 正面化後のサイズ（damage-detection-algorithms.md §1.2）
   const PX_TO_MM_DEFAULT = 63.0 / RECT_W;
-  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260430-boundary-bg-support';
+  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260501-centering-border-color';
 
   // ============================================================
   // 検出パラメータ（精度向上用の閾値）

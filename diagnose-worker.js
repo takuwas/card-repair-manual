@@ -162,7 +162,7 @@
       }
 
       return {
-        engine: { name: 'opencv-worker', version: '0.4.1' },
+        engine: { name: 'opencv-worker', version: '0.4.2' },
         detections,
         imageQuality,
         holoInfo,
@@ -1225,6 +1225,9 @@
       cv.cvtColor(rectMat, rgb, cv.COLOR_RGBA2RGB);
       cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
       cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+      const borderColor = detectBorderColorInnerFrame(rgb, hsv, W, H);
+      const borderStable = borderColor ? stabilizeCenteringFrame(borderColor, W, H) : null;
+      if (borderStable && isPlausibleFrame(borderStable, W, H)) return borderStable;
       const projected = detectProjectedInnerFrame(gray, hsv, W, H);
       const projectedStable = projected ? stabilizeCenteringFrame(projected, W, H) : null;
       if (projectedStable && isPlausibleFrame(projectedStable, W, H)) return projectedStable;
@@ -1234,6 +1237,138 @@
     } finally {
       rgb.delete(); gray.delete(); hsv.delete();
     }
+  }
+
+  function detectBorderColorInnerFrame(rgb, hsv, W, H) {
+    const top = findBorderColorTransition(rgb, hsv, 'top', W, H);
+    const bottom = findBorderColorTransition(rgb, hsv, 'bottom', W, H);
+    const left = findBorderColorTransition(rgb, hsv, 'left', W, H);
+    const right = findBorderColorTransition(rgb, hsv, 'right', W, H);
+    if (!top || !bottom || !left || !right) return null;
+    const confidence = clamp01((top.confidence + bottom.confidence + left.confidence + right.confidence) / 4);
+    return {
+      top: top.margin,
+      bottom: bottom.margin,
+      left: left.margin,
+      right: right.margin,
+      outer: [0, 0, W, H],
+      inner: [Math.round(left.margin), Math.round(top.margin), Math.round(W - right.margin), Math.round(H - bottom.margin)],
+      confidence,
+      method: 'border_color',
+      metrics: {
+        top_score: top.score,
+        bottom_score: bottom.score,
+        left_score: left.score,
+        right_score: right.score,
+      },
+    };
+  }
+
+  function findBorderColorTransition(rgb, hsv, side, W, H) {
+    const vertical = side === 'top' || side === 'bottom';
+    const maxScan = Math.round((vertical ? H : W) * (vertical ? 0.095 : 0.12));
+    const minScan = Math.round((vertical ? H : W) * (vertical ? 0.012 : 0.018));
+    const ref = sampleBorderReference(rgb, hsv, side, W, H);
+    if (!ref) return null;
+
+    const samples = [];
+    for (let d = 0; d <= maxScan; d += 2) {
+      samples.push({ margin: d, score: borderColorProfileScore(rgb, hsv, side, d, ref, W, H) });
+    }
+    if (samples.length < 8) return null;
+
+    const scores = smoothScores(samples.map(s => s.score), 2);
+    const earlyScores = samples
+      .map((s, i) => s.margin <= minScan ? scores[i] : null)
+      .filter(v => v != null);
+    const base = earlyScores.length ? percentile(earlyScores, 0.55) : scores[0];
+    const high = percentile(scores, 0.88);
+    const threshold = Math.max(base + 12, base + (high - base) * 0.42, 18);
+    if (high - base < 10) return null;
+
+    let best = -1;
+    for (let i = 0; i < samples.length; i++) {
+      if (samples[i].margin < minScan) continue;
+      const next = scores[Math.min(scores.length - 1, i + 1)];
+      const next2 = scores[Math.min(scores.length - 1, i + 2)];
+      if (scores[i] >= threshold && next >= threshold * 0.78 && next2 >= threshold * 0.72) {
+        best = i;
+        break;
+      }
+    }
+    if (best < 0) return null;
+
+    const confidence = clamp01(0.45 + (scores[best] - threshold) / 42 + (high - base) / 120);
+    return { margin: samples[best].margin, score: scores[best], confidence };
+  }
+
+  function sampleBorderReference(rgb, hsv, side, W, H) {
+    const vertical = side === 'top' || side === 'bottom';
+    const fixedStart = vertical
+      ? (side === 'top' ? Math.round(H * 0.006) : Math.round(H * 0.982))
+      : (side === 'left' ? Math.round(W * 0.006) : Math.round(W * 0.982));
+    const fixedEnd = vertical
+      ? (side === 'top' ? Math.round(H * 0.022) : Math.round(H * 0.996))
+      : (side === 'left' ? Math.round(W * 0.022) : Math.round(W * 0.996));
+    const rangeStart = vertical ? Math.round(W * 0.12) : Math.round(H * 0.12);
+    const rangeEnd = vertical ? Math.round(W * 0.88) : Math.round(H * 0.88);
+    const vals = [];
+    const step = Math.max(3, Math.round((rangeEnd - rangeStart) / 36));
+    for (let a = rangeStart; a <= rangeEnd; a += step) {
+      for (let f = fixedStart; f <= fixedEnd; f += 3) {
+        const x = vertical ? a : f;
+        const y = vertical ? f : a;
+        const sample = readRgbHsv(rgb, hsv, clamp(Math.round(x), 0, W - 1), clamp(Math.round(y), 0, H - 1));
+        if (sample) vals.push(sample);
+      }
+    }
+    if (!vals.length) return null;
+    return {
+      r: avgValues(vals.map(v => v.r)),
+      g: avgValues(vals.map(v => v.g)),
+      b: avgValues(vals.map(v => v.b)),
+      s: avgValues(vals.map(v => v.s)),
+      v: avgValues(vals.map(v => v.v)),
+    };
+  }
+
+  function borderColorProfileScore(rgb, hsv, side, margin, ref, W, H) {
+    const vertical = side === 'top' || side === 'bottom';
+    const y = side === 'top' ? margin : side === 'bottom' ? H - 1 - margin : null;
+    const x = side === 'left' ? margin : side === 'right' ? W - 1 - margin : null;
+    const rangeStart = vertical ? Math.round(W * 0.12) : Math.round(H * 0.12);
+    const rangeEnd = vertical ? Math.round(W * 0.88) : Math.round(H * 0.88);
+    const step = Math.max(4, Math.round((rangeEnd - rangeStart) / 48));
+    const vals = [];
+    for (let a = rangeStart; a <= rangeEnd; a += step) {
+      const sx = vertical ? a : x;
+      const sy = vertical ? y : a;
+      const sample = readRgbHsv(rgb, hsv, clamp(Math.round(sx), 0, W - 1), clamp(Math.round(sy), 0, H - 1));
+      if (!sample) continue;
+      const dr = sample.r - ref.r;
+      const dg = sample.g - ref.g;
+      const db = sample.b - ref.b;
+      const rgbDist = Math.sqrt(dr * dr + dg * dg + db * db);
+      vals.push(rgbDist * 0.72 + Math.abs(sample.s - ref.s) * 0.42 + Math.abs(sample.v - ref.v) * 0.18);
+    }
+    return vals.length ? percentile(vals, 0.58) : 0;
+  }
+
+  function readRgbHsv(rgb, hsv, x, y) {
+    const W = rgb.cols;
+    const idx = (y * W + x) * 3;
+    return {
+      r: rgb.data[idx],
+      g: rgb.data[idx + 1],
+      b: rgb.data[idx + 2],
+      h: hsv.data[idx],
+      s: hsv.data[idx + 1],
+      v: hsv.data[idx + 2],
+    };
+  }
+
+  function avgValues(values) {
+    return values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : 0;
   }
 
   function detectProjectedInnerFrame(gray, hsv, W, H) {
@@ -1387,8 +1522,8 @@
   }
 
   function stabilizeCenteringFrame(frame, W, H) {
-    const h = constrainMarginPair(frame.left, frame.right, W * 0.025, W * 0.13);
-    const v = constrainMarginPair(frame.top, frame.bottom, H * 0.018, H * 0.13);
+    const h = constrainMarginPair(frame.left, frame.right, W * 0.025, W * (frame.method === 'border_color' ? 0.115 : 0.12));
+    const v = constrainMarginPair(frame.top, frame.bottom, H * 0.018, H * (frame.method === 'border_color' ? 0.085 : 0.095));
     if (!h || !v) return null;
     const stabilized = h.stabilized || v.stabilized;
     const left = h.a;
