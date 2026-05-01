@@ -79,7 +79,7 @@
   const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
   const RECT_W = 750, RECT_H = 1050; // 正面化後のサイズ（damage-detection-algorithms.md §1.2）
   const PX_TO_MM_DEFAULT = 63.0 / RECT_W;
-  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260430-boundary-ensemble';
+  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260430-boundary-bg-support';
 
   // ============================================================
   // 検出パラメータ（精度向上用の閾値）
@@ -181,7 +181,7 @@
     suppressClick: false,
   };
   const PRECISION_STEPS = [
-    { id: 'front', label: '正面', subtitle: 'カードの四隅を枠に合わせ、真上から撮影します。' },
+    { id: 'front', label: '正面', subtitle: '黒い無地背景で、カードの四隅を枠に合わせて真上から撮影します。' },
     { id: 'left', label: '左斜め', subtitle: 'スマホを少し左へずらして、反射と凹みの陰影を変えて撮影します。' },
     { id: 'right', label: '右斜め', subtitle: 'スマホを少し右へずらして、別角度の陰影を確認します。' },
   ];
@@ -701,7 +701,7 @@
     if (guidedCameraTitle) guidedCameraTitle.textContent = precision ? '高精度モード' : 'カードを撮影';
     if (guidedCameraSubtitle) guidedCameraSubtitle.textContent = precision
       ? `${guidedCameraState.stepIndex + 1}/3: ${step.subtitle}`
-      : 'カードの四隅を枠に合わせ、真上から撮影します。';
+      : '黒い無地背景で、カード外周の周りに5〜10%の余白を残して撮影します。';
     if (cameraAngleBadge) cameraAngleBadge.textContent = step.label;
     if (guidedCameraCapture) guidedCameraCapture.textContent = precision
       ? (guidedCameraState.stepIndex >= PRECISION_STEPS.length - 1 ? '3枚目を撮影して解析' : `${guidedCameraState.stepIndex + 1}枚目を撮影`)
@@ -722,7 +722,7 @@
       const qualityText = guidedCameraState.qualityLabel
         ? `画質: ${guidedCameraState.qualityLabel}。`
         : '利用可能な最高画質を要求しています。';
-      guidedCameraStatus.textContent = `${zoomText} ${qualityText} カード全体を枠内に入れ、白飛びしない角度で撮影してください。`;
+      guidedCameraStatus.textContent = `${zoomText} ${qualityText} マットな黒い無地背景を使い、カード外周の周りに5〜10%の余白を残してください。`;
     }
     updateOrientationGuide();
   }
@@ -945,11 +945,11 @@
         showError({
           code: 'card_not_found',
           message: 'カードが認識できません',
-          hint: '明るい背景・カード全体が枠内に収まるよう正面から撮影し、再度お試しください。',
+          hint: 'マットな黒い無地背景で、カード外周の周りに5〜10%の余白を残して正面から撮影し、再度お試しください。',
           hints: [
             'カードの四隅が枠内にすべて収まっていますか？',
             '真上から撮影していますか？（斜め撮影は失敗の原因）',
-            '背景とカードのコントラスト（黒い背景がおすすめ）',
+            '背景はマットな黒い無地の紙・布にしていますか？（白背景はグレー外枠を誤認しやすいです）',
             'ピントは合っていますか？',
           ],
         });
@@ -990,7 +990,7 @@
       showError({
         code: 'internal_error',
         message: '高精度解析がタイムアウトしました',
-        hint: '3枚の解析に時間がかかっています。ページを再読み込みして、通常モードまたは明るい場所で再撮影してください。',
+        hint: '3枚の解析に時間がかかっています。ページを再読み込みして、通常モード、または明るい場所のマットな黒い無地背景で再撮影してください。',
       });
     }, WATCHDOG_MS);
 
@@ -1035,7 +1035,7 @@
           message: 'カードが認識できません',
           hints: [
             '3枚ともカードの四隅が枠内に収まっていますか？',
-            'カードと背景の境界が見える明るさですか？',
+            'マットな黒い無地背景で、カード外周と背景の境界がはっきり見えていますか？',
             '2倍望遠または少し離れた位置から撮影していますか？',
           ],
         });
@@ -1923,9 +1923,13 @@
       message: ({
         too_dark:      '画像が暗すぎます。明るい場所で再撮影をお勧めします。',
         too_bright:    '画像が明るすぎます（白飛びの可能性）。',
-        low_contrast:  'コントラストが不足しています。背景とのコントラストを確保してください。',
+        low_contrast:  'コントラストが不足しています。マットな黒い無地背景で撮影してください。',
         motion_blur:   '画像がブレている可能性があります。',
         estimated_boundary: 'カード外周を明確に切り出せなかったため、中央のカード比率から境界を推定しています。',
+        boundary_too_close: 'カード外周が画像端に近すぎます。外周の周りに5〜10%の黒背景が見える余白を残してください。',
+        boundary_weak_edge: 'カード外周の直線エッジが弱く、内側の印刷線を拾う可能性があります。真上から撮り直してください。',
+        boundary_low_contrast: 'カード外周と背景の境界コントラストが弱いです。白背景ではなく黒い無地背景を推奨します。',
+        boundary_background_mismatch: '検出した枠の外側が背景色と一致していません。内側の印刷枠を外周として拾っている可能性があります。',
       }[code]) || code,
     }));
     const noDetectWarn = detections.length === 0 ? [{ code: 'no_detections', message: '損傷は検出されませんでした。' }] : [];

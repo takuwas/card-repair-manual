@@ -119,6 +119,10 @@
       const r = safeCall(() => rectifyCardOptimized(src), 'rectifyCardOptimized');
       if (!r) return { error: 'card_not_detected' };
       rect = r.rect;
+      const boundaryWarnings = safeCall(() => assessBoundaryWarnings(r, src.cols, src.rows), 'assessBoundaryWarnings') || [];
+      if (boundaryWarnings.length) {
+        imageQuality.warnings = Array.from(new Set([...(imageQuality.warnings || []), ...boundaryWarnings]));
+      }
 
       progress(requestId, 56, '照明を正規化中', 2);
       safeCall(() => normalizeIllumination(rect), 'normalizeIllumination');
@@ -158,7 +162,7 @@
       }
 
       return {
-        engine: { name: 'opencv-worker', version: '0.4.0' },
+        engine: { name: 'opencv-worker', version: '0.4.1' },
         detections,
         imageQuality,
         holoInfo,
@@ -182,6 +186,24 @@
       self.postMessage({ type: 'log', level: 'warn', message: `${name}: ${err.message || err}` });
       return null;
     }
+  }
+
+  function assessBoundaryWarnings(result, imageW, imageH) {
+    const warnings = [];
+    if (!result || !result.quad) return warnings;
+    const q = result.quad;
+    const minMargin = Math.min(
+      ...q.map(p => p.x),
+      ...q.map(p => p.y),
+      ...q.map(p => imageW - p.x),
+      ...q.map(p => imageH - p.y),
+    ) / Math.min(imageW, imageH);
+    if (minMargin < 0.035) warnings.push('boundary_too_close');
+    const m = result.metrics || {};
+    if (Number.isFinite(m.edge_support) && m.edge_support < 0.22) warnings.push('boundary_weak_edge');
+    if (Number.isFinite(m.contrast_support) && m.contrast_support < 0.18) warnings.push('boundary_low_contrast');
+    if (Number.isFinite(m.background_support) && m.background_support < 0.25) warnings.push('boundary_background_mismatch');
+    return warnings;
   }
 
   function rectifyCardOptimized(srcMat) {
@@ -225,7 +247,8 @@
       if (houghFromAdaptive) candidates.push({ quad: houghFromAdaptive, method: 'adaptive_hough_lines', area: polygonArea(houghFromAdaptive) });
 
       let best = null;
-      const scoringContext = { edgeMat: edges, srcMat };
+      const bgPatch = Math.max(10, Math.round(Math.min(srcMat.cols, srcMat.rows) * 0.045));
+      const scoringContext = { edgeMat: edges, srcMat, backgroundColor: averageCornerColorOptimized(srcMat, bgPatch) };
       const seen = new Set();
       candidates
         .sort((a, b) => (b.area || 0) - (a.area || 0))
@@ -264,7 +287,7 @@
         rect,
         quad: cardQuad,
         method: best ? best.method : 'center_fallback',
-        boundary_confidence: best ? clamp01(best.score / 5.2) : 0.25,
+        boundary_confidence: best ? clamp01(best.score / 6.1) : 0.25,
         metrics: best ? best.metrics : null,
       };
     } finally {
@@ -489,14 +512,18 @@
     const centerDist = Math.hypot((cx - imageW / 2) / imageW, (cy - imageH / 2) / imageH);
     const edgeSupport = context.edgeMat ? sampleEdgeSupportOptimized(context.edgeMat, sorted) : 0;
     const contrastSupport = context.srcMat ? sampleBoundaryContrastOptimized(context.srcMat, sorted) : 0;
+    const backgroundSupport = context.srcMat && context.backgroundColor
+      ? sampleOutsideBackgroundSupportOptimized(context.srcMat, sorted, context.backgroundColor)
+      : 0;
     const fill = clamp01(areaRatio / 0.42);
     const methodBonus = method && method.includes('hough') ? 0.35
       : method && method.includes('mask') ? 0.28
       : method && method.includes('quad') ? 0.26
       : method && method.includes('rotated') ? 0.16
       : 0.02;
-    const supportScore = edgeSupport * 1.15 + contrastSupport * 0.95;
-    const score = fill * 1.25 + areaRatio * 1.35 + (1 - ratioPenalty) * 1.45 + supportScore + methodBonus - centerDist * 0.65;
+    const supportScore = edgeSupport * 1.05 + contrastSupport * 0.75 + backgroundSupport * 1.25;
+    let score = fill * 1.2 + areaRatio * 1.3 + (1 - ratioPenalty) * 1.45 + supportScore + methodBonus - centerDist * 0.65;
+    if (backgroundSupport < 0.25 && areaRatio < 0.75) score -= 0.45;
     return {
       quad: sorted,
       score,
@@ -506,6 +533,7 @@
         ratio_penalty: ratioPenalty,
         edge_support: edgeSupport,
         contrast_support: contrastSupport,
+        background_support: backgroundSupport,
         center_distance: centerDist,
       },
     };
@@ -578,6 +606,40 @@
       }
     }
     return count ? clamp01((total / count) / 82) : 0;
+  }
+
+  function sampleOutsideBackgroundSupportOptimized(srcMat, quad, backgroundColor) {
+    const center = {
+      x: quad.reduce((sum, p) => sum + p.x, 0) / 4,
+      y: quad.reduce((sum, p) => sum + p.y, 0) / 4,
+    };
+    let total = 0;
+    let count = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = quad[i];
+      const b = quad[(i + 1) % 4];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.max(1, Math.hypot(dx, dy));
+      const normals = [
+        { x: -dy / len, y: dx / len },
+        { x: dy / len, y: -dx / len },
+      ];
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const n = dist({ x: mid.x + normals[0].x * 10, y: mid.y + normals[0].y * 10 }, center) >
+        dist({ x: mid.x + normals[1].x * 10, y: mid.y + normals[1].y * 10 }, center) ? normals[0] : normals[1];
+      const samples = Math.max(14, Math.min(64, Math.round(len / 24)));
+      for (let s = 1; s < samples; s++) {
+        const t = s / samples;
+        const x = a.x + dx * t;
+        const y = a.y + dy * t;
+        const outside = readRgbaOptimized(srcMat, x + n.x * 12, y + n.y * 12);
+        if (!outside) continue;
+        total += 1 - clamp01(colorDistanceOptimized(outside, [backgroundColor.r, backgroundColor.g, backgroundColor.b]) / 95);
+        count++;
+      }
+    }
+    return count ? clamp01(total / count) : 0;
   }
 
   function readRgbaOptimized(mat, x, y) {
