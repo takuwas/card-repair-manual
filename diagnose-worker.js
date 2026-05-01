@@ -162,7 +162,7 @@
       }
 
       return {
-        engine: { name: 'opencv-worker', version: '0.4.2' },
+        engine: { name: 'opencv-worker', version: '0.4.3' },
         detections,
         imageQuality,
         holoInfo,
@@ -1570,20 +1570,14 @@
     const horizDev = Math.abs(left - right) / horizSum * 100;
     const vertDev = Math.abs(top - bottom) / vertSum * 100;
     const worstRatio = Math.max(leftPct, rightPct, topPct, bottomPct);
-    let estimatedGrade;
-    if (worstRatio <= 55) estimatedGrade = 'GEM MINT 10';
-    else if (worstRatio <= 60) estimatedGrade = 'MINT 9';
-    else if (worstRatio <= 65) estimatedGrade = 'NM-MT 8';
-    else if (worstRatio <= 70) estimatedGrade = 'NM 7';
-    else if (worstRatio <= 80) estimatedGrade = 'EX-MT 6';
-    else if (worstRatio <= 85) estimatedGrade = 'EX 5/4';
-    else if (worstRatio <= 90) estimatedGrade = 'VG or lower';
-    else estimatedGrade = 'OC';
+    const estimate = estimateCenteringGrade(worstRatio, frame.confidence);
     return {
       horizontal: { leftPx: left, rightPx: right, leftPercent: leftPct, rightPercent: rightPct, deviation: horizDev, label: `${Math.round(leftPct)}/${Math.round(rightPct)}` },
       vertical: { topPx: top, bottomPx: bottom, topPercent: topPct, bottomPercent: bottomPct, deviation: vertDev, label: `${Math.round(topPct)}/${Math.round(bottomPct)}` },
-      estimatedGrade,
-      overallScore: Math.max(0, Math.round(100 - (worstRatio - 50) * 2)),
+      estimatedGrade: estimate.label,
+      centeringStandard: estimate.standard,
+      centeringOnly: true,
+      overallScore: computeCenteringScore(worstRatio),
       worstDeviation: Math.max(horizDev, vertDev),
       worstRatio,
       annotation: { outer_rect: frame.outer, inner_rect: frame.inner },
@@ -1591,6 +1585,24 @@
       method: frame.method,
       stabilized: !!frame.stabilized,
     };
+  }
+
+  function estimateCenteringGrade(worstRatio, confidence) {
+    if (!Number.isFinite(worstRatio) || (Number.isFinite(confidence) && confidence < 0.55)) {
+      return { label: 'CENTERING CHECK', standard: 'low_confidence' };
+    }
+    if (worstRatio <= 52) return { label: 'STRICT 10 CENTERING', standard: 'strict_10_centering' };
+    if (worstRatio <= 55) return { label: 'PSA 10 CENTERING RANGE', standard: 'psa_10_centering_range' };
+    if (worstRatio <= 60) return { label: 'PSA 9 CENTERING RANGE', standard: 'psa_9_centering_range' };
+    if (worstRatio <= 65) return { label: 'PSA 8 CENTERING RANGE', standard: 'psa_8_centering_range' };
+    if (worstRatio <= 70) return { label: 'PSA 7 CENTERING RANGE', standard: 'psa_7_centering_range' };
+    if (worstRatio <= 80) return { label: 'OFF-CENTER WARNING', standard: 'off_center_warning' };
+    return { label: 'OFF-CENTER', standard: 'off_center' };
+  }
+
+  function computeCenteringScore(worstRatio) {
+    if (!Number.isFinite(worstRatio)) return 0;
+    return Math.max(0, Math.round(100 - Math.max(0, worstRatio - 50) * 5));
   }
 
   function computeAdaptiveCannyThresholds(grayMat) {

@@ -79,7 +79,7 @@
   const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
   const RECT_W = 750, RECT_H = 1050; // 正面化後のサイズ（damage-detection-algorithms.md §1.2）
   const PX_TO_MM_DEFAULT = 63.0 / RECT_W;
-  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260501-centering-border-color';
+  const DIAGNOSE_WORKER_URL = 'diagnose-worker.js?v=20260501-centering-grade-strict';
 
   // ============================================================
   // 検出パラメータ（精度向上用の閾値）
@@ -1968,6 +1968,8 @@
             deviation_pct: centering.vertical.deviation,
           },
           estimated_grade: centering.estimatedGrade,
+          centering_standard: centering.centeringStandard || null,
+          centering_only: centering.centeringOnly !== false,
           score_0_100: centering.overallScore,
           worst_ratio: centering.worstRatio,
           method: centering.method,
@@ -2141,6 +2143,7 @@
         + ` 最も悪い比率は約 ${wr.toFixed(1)}/${(100 - wr).toFixed(1)}、推定グレード ${centering.estimated_grade} です。`
         + (centering.stabilized ? ' 内部の文字線を拾わないよう、現実的なセンタリング範囲へ補正しています。' : '')
         + ` ※ 画像からの参考値で、正式鑑定結果を保証するものではありません。`;
+      note.textContent += ' 表示はセンタリング単体の目安で、角・エッジ・表面を含む最終グレードではありません。';
     }
 
     // オーバーレイトグル
@@ -3227,22 +3230,15 @@
     const worstDeviation = Math.max(horizDev, vertDev);
     const worstRatio = Math.max(leftPct, rightPct, topPct, bottomPct);
 
-    let estimatedGrade;
-    if (worstRatio <= 55) estimatedGrade = 'GEM MINT 10';
-    else if (worstRatio <= 60) estimatedGrade = 'MINT 9';
-    else if (worstRatio <= 65) estimatedGrade = 'NM-MT 8';
-    else if (worstRatio <= 70) estimatedGrade = 'NM 7';
-    else if (worstRatio <= 80) estimatedGrade = 'EX-MT 6';
-    else if (worstRatio <= 85) estimatedGrade = 'EX 5/4';
-    else if (worstRatio <= 90) estimatedGrade = 'VG or lower';
-    else estimatedGrade = 'OC';
-
-    const overallScore = Math.max(0, Math.round(100 - (worstRatio - 50) * 2));
+    const estimate = estimateCenteringGrade(worstRatio, frame.confidence);
+    const overallScore = computeCenteringScore(worstRatio);
 
     return {
       horizontal,
       vertical,
-      estimatedGrade,
+      estimatedGrade: estimate.label,
+      centeringStandard: estimate.standard,
+      centeringOnly: true,
       overallScore,
       worstDeviation,
       worstRatio,
@@ -3253,6 +3249,24 @@
       detection_confidence: frame.confidence,
       stabilized: !!frame.stabilized,
     };
+  }
+
+  function estimateCenteringGrade(worstRatio, confidence) {
+    if (!Number.isFinite(worstRatio) || (Number.isFinite(confidence) && confidence < 0.55)) {
+      return { label: 'CENTERING CHECK', standard: 'low_confidence' };
+    }
+    if (worstRatio <= 52) return { label: 'STRICT 10 CENTERING', standard: 'strict_10_centering' };
+    if (worstRatio <= 55) return { label: 'PSA 10 CENTERING RANGE', standard: 'psa_10_centering_range' };
+    if (worstRatio <= 60) return { label: 'PSA 9 CENTERING RANGE', standard: 'psa_9_centering_range' };
+    if (worstRatio <= 65) return { label: 'PSA 8 CENTERING RANGE', standard: 'psa_8_centering_range' };
+    if (worstRatio <= 70) return { label: 'PSA 7 CENTERING RANGE', standard: 'psa_7_centering_range' };
+    if (worstRatio <= 80) return { label: 'OFF-CENTER WARNING', standard: 'off_center_warning' };
+    return { label: 'OFF-CENTER', standard: 'off_center' };
+  }
+
+  function computeCenteringScore(worstRatio) {
+    if (!Number.isFinite(worstRatio)) return 0;
+    return Math.max(0, Math.round(100 - Math.max(0, worstRatio - 50) * 5));
   }
 
   /**
